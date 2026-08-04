@@ -516,6 +516,59 @@ export class LLMWrapper {
       return Model;
   }
 
+  generateQuantitativeSDCodeResponseSchema(mentorMode, supportsArrays, supportsSubTypes) {
+    const TypeEnum = z.enum(["stock", "flow", "variable"]).describe(LLMWrapper.SCHEMA_STRINGS.type);
+    const PolarityEnum = z.enum(["+", "-"]).describe(LLMWrapper.SCHEMA_STRINGS.polarity);
+    const Dimension = LLMWrapper.dimensionSchema();
+    const GraphicalFunction = LLMWrapper.graphicalFunctionSchema().describe(LLMWrapper.SCHEMA_STRINGS.gfEquation);
+    const Relationship = z.object(LLMWrapper.relationshipSchemaBase()).describe(LLMWrapper.SCHEMA_STRINGS.relationship);
+    const Relationships = z.array(Relationship).describe(LLMWrapper.SCHEMA_STRINGS.relationships);
+    const ArrayElementEquation = LLMWrapper.arrayElementEquationSchema().describe(LLMWrapper.SCHEMA_STRINGS.arrayElementEquation);
+
+    const variableObj = {
+      name: z.string().describe(LLMWrapper.SCHEMA_STRINGS.name),
+      equation: z.string().describe(LLMWrapper.SCHEMA_STRINGS.equation),
+      inflows: z.array(z.string()).describe(LLMWrapper.SCHEMA_STRINGS.inflows),
+      outflows: z.array(z.string()).describe(LLMWrapper.SCHEMA_STRINGS.outflows),
+      graphicalFunction: GraphicalFunction,
+      type: TypeEnum,
+      uniflow: z.boolean().describe(LLMWrapper.SCHEMA_STRINGS.uniflow),
+      crossLevelGhostOf: z.string().describe(LLMWrapper.SCHEMA_STRINGS.crossLevelGhostOf),
+      documentation: z.string().describe(LLMWrapper.SCHEMA_STRINGS.documentation),
+      units: z.string().describe(LLMWrapper.SCHEMA_STRINGS.units)
+    };
+
+    if (supportsArrays) {
+      variableObj.dimensions = z.array(z.string()).describe(LLMWrapper.SCHEMA_STRINGS.variableDimensions);
+      variableObj.arrayEquations = z.array(ArrayElementEquation).describe(LLMWrapper.SCHEMA_STRINGS.variableArrayEquation);
+    }
+
+    if (supportsSubTypes) {
+      variableObj.subType = LLMWrapper.subTypeSchema().optional();
+      variableObj.additionalProperties = LLMWrapper.additionalPropertiesSchema().describe(LLMWrapper.SCHEMA_STRINGS.additionalProperties).optional();
+    }
+
+    const Variable = z.object(variableObj);
+    const Variables = z.array(Variable).describe(LLMWrapper.SCHEMA_STRINGS.variables);
+
+    const simSpecsObj = LLMWrapper.simSpecsSchemaBase();
+    if (!supportsArrays) delete simSpecsObj.arrayDimensions;
+    const SimSpecs = z.object(simSpecsObj).describe(LLMWrapper.SCHEMA_STRINGS.simSpecs);
+
+    const Module = LLMWrapper.moduleSchema();
+
+    const Model = z.object({
+      variables: Variables,
+      relationships: Relationships,
+      explanation: z.string().describe(mentorMode ? LLMWrapper.SCHEMA_STRINGS.mentorModeQuantExplanation: LLMWrapper.SCHEMA_STRINGS.quantExplanation),
+      title: z.string().describe(LLMWrapper.SCHEMA_STRINGS.title),
+      specs: SimSpecs,
+      modules: z.array(Module).describe(LLMWrapper.SCHEMA_STRINGS.modules)
+    });
+
+    return Model;
+  }
+
     static DEFAULT_TEMPERATURE = undefined; //by default keep temperature undefined
 
   /**

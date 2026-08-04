@@ -1,0 +1,19 @@
+{
+    "sequential": true,
+    "verbose": true,
+    "engineConfigs": {
+        "quantitative-sdcode-gemini-3-flash-preview": {
+            "engine": "quantitative-sdcode",
+            "additionalParameters": {
+                "underlyingModel": "gemini-3-flash-preview low"
+            },
+            "limits": {
+                "tokensPerMinute": 90000,
+                "requestsPerMinute": 10
+            }
+        }
+    },
+    "categories": {
+        "quantitativeTranslation": true
+    }
+}
