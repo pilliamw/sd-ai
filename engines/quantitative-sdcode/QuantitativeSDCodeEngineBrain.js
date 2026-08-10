@@ -11,117 +11,125 @@ class ResponseFormatError extends Error {
 }
 
 class QuantitativeSDCodeEngineBrain {
+    static SDCODE_SYNTAX_GUIDE=
+`
+To construct SFD models, you will output a program written in a language called SDCode. 
+SDCode uses a syntax similar to that of the programming language Python.
+Please output your SDCode program in a markdown code block using triple backticks at the start and end;
+you will receive an error message if you do not do so as the program cannot be parsed otherwise.
+
+Below is a sample program that highlights all of the syntax rules of SDCode.
+\`\`\`
+### WRITING COMMENTS: Comments work the exact same they do in Python.
+# When using comments to explain the reasoning for a created variable/relationship,
+# append the comment directly to the end of the code line, to ensure it is recognized correctly.
+# Comments never directly affect how a simulation runs.
+
+### SIMULATION SETUP
+# The commands listed below set up the parameters that define how the model simulation should run.
+
+setTimeUnits("year") # The unit of time for this model. This should match with the equations that you generate. Takes a string as its singular argument.
+setStartTime(0) # The time at which this model starts calculating. It is measured in the units of "timeUnits". Takes a number as its singular argument.
+setStartTime(10.0) # The time at which this model stops calculating. It is measured in the units of "timeUnits". Takes a number as its singular argument.
+setTimeStep(0.25) # The time step for the model, how often is it calculated. The most common dt is 0.25. It is measured in the units of "timeUnits". Takes a number as its singular argument.
+setIntegrationMethod("euler") # The method used to solve this model. The single required argument is either the string "euler" or "rk4". "euler" is the default, use "rk4" for systems with oscillations.
+
+### NAMING CONVENTIONS
+# Model components are identified by a unique name.
+# This name is allowed to comprise only of alphanumeric characters, the "_" character, and spaces.
+# Unlike python, when defining and referencing these components, the name must be wrapped in [square brackets].
+
+### COMPONENT TYPES
+# There are three main component types - stocks, flows, and variables. 
+# A stock is an accumulation of its flows, it is an integral. A stock can only change because of its flows. 
+# A flow is the derivative of a stock. 
+# A plain variable is used for algebraic expressions.
+
+### CREATING VARIABLES
+# The single argument taken is a string describing the unit.
+[varA] = new Variable("units") # reasoning for creating [varA]
+[variable b] = new Variable("units") # reasoning for creating [variable b]
+[variable c] = new Variable("units") # reasoning for creating [variable c]
+
+### DEFINING EQUATIONS
+# Set the XMILE equation for a component with the .setEquation method. This takes one argument, the XMILE equation as a string.
+# Every component must have exactly one XMILE equation defined for it somewhere in the simulation 
+# (although it does not need to be immediately after declaration).
+# This equation can be a number, or an algebraic expression of other variables.
+# Refer to other variables with their [bracketed] name. 
+# If the bracketed name contains spaces [like this], replace them with underscores [like_this].
+# NEVER use IF THEN ELSE or conditional functions inside of equations. 
+# If you want to check for division by zero use the operator //
+# STOCKS ONLY: The .setEquation method sets the **initial value** of the stock. The equations for flows are automatically applied;
+# you do not need to manually make any INTEG calls.
+[varA].setEquation("10") # [varA] is set to the numeric value of 10
+[variable b].setEquation("5*[varA]") # [variable b] is set to be 5 times [varA]
+[variable c].setEquation("[varA] + [variable_b]") # [variable c] is set to be the sum of [varA] and [variable b]
+
+### CREATING STOCKS
+# The single argument taken is a string describing the unit.
+[stockA] = new Stock("units")
+[stockA].setEquation("100") # [stockA] has an initial value of 100
+[stockB] = new Stock("units")
+[stockB].setEquation("0") # [stockB] has an initial value of 0
+
+### CREATING FLOWS
+# The single argument taken is a string describing the unit.
+[flowA] = new Flow("units")
+[flowB] = new Flow("units")
+[flowA].setEquation("[variable_b]")
+[flowB].setEquation("[variable_c]*[stockA]")
+
+### UNIFLOW FLOWS
+# By default, all flows are bi-directional.
+# Use the .setUniflow method on flows to prevent them from going negative.
+# A uniflow flow represents a one-directional process that can only add to or subtract from a stock in one direction.
+# If set to uniflow, the flow will be constrained to be non-negative during simulation - if the equation would produce a negative value, 
+# it will be set to zero instead.
+# Common examples of uniflow flows: births, deaths, purchases, production. 
+# Common examples of non-uniflow flows: net migration, balance adjustments, corrections.
+[flowA].setUniflow()
+
+### SETTING FLOWS
+# Use the .addInflow and .addOutflow methods on a stock to attach flows.
+# CRITICAL: A flow can never be both an inflow and outflow of the same stock.
+# (However, it is ok for a flow to be the inflow of one stock and the outflow of a different stock.)
+[stockA].setInflow([flowA])
+[stockA].setOutflow([flowB])
+[stockB].setInflow([flowB])
+
+### SPECIFYING RELATIONSHIPS
+# You should specify "cause-effect" relationships between every pair of components in the model.
+# To do so, use the .connect method, which is available on all components.
+# Call the .connect method on the "causal" component.
+# The .connect method takes two arguments; the first argument is the "effect" component and is REQUIRED, 
+# and the second is an OPTIONAL boolean that indicates the polarity of the relationship.
+# Set this to true if the relationship has positive polarity, and false if the relationship has negative polarity.
+# In relationships with positive polarity (+) a change in the from variable causes a change in the same direction in the to variable.  For example, in a relationship with positive polarity (+), a decrease in the from variable, would lead to a decrease in the to variable.  The second kind of relationship are those with negative polarity that are represented with a - symbol.  In relationships with negative polarity (-) a change in the from variable causes a change in the opposite direction in the to variable.  For example, in a relationship with negative polarity (-) an increase in the from variable, would lead to a decrease in the to variable.
+# If it does not make sense to define a polarity for a relationship, do not pass a boolean at all.
+# You can call the .connect method at any point in the model's program, provided both components have been previously defined.
+[varA].connect([variable b]) # the reasoning for this relationship
+[varA].connect([variable c])
+[variable b].connect([variable c])
+[variable b].connect([flowA])
+[variable c].connect([flowB])
+[stockA].connect([flowB])
+[flowA].connect([stockA], true)
+[flowB].connect([stockA], false)
+[flowB].connect([stockB], true)
+\`\`\`
+`
     static MODULE_REQUIREMENTS_SECTION =
-`CRITICAL MODULAR MODEL REQUIREMENTS:
-
-WHEN TO USE MODULES:
-- DO NOT create modules unless the model already uses modules OR the user explicitly requests modular structure
-- If the existing model has NO modules, build a NON-MODULAR model
-- If the existing model HAS modules, maintain and extend the modular structure
-- Only introduce modules when specifically asked by the user
-
-CRITICAL VARIABLE NAMING RULE FOR MODULES:
-- Variable names in modules use ONLY their immediate owning module as prefix: ModuleName.variableName
-- NEVER use full hierarchy path in variable names
-- CORRECT: "Sales.revenue" (even if Sales is nested within Company module)
-- WRONG: "Company.Sales.revenue"
-- Variables are qualified ONLY by their direct parent module, never by ancestor modules
-- Module hierarchy is tracked separately in the modules array via parentModule field
-
-WHEN USING MODULES - GHOST VARIABLE REQUIREMENTS:
-When constructing modular models, you MUST create cross-level ghost variables for ALL inter-module references:
-1. Create the source variable in its computation module
-2. Create a cross-level ghost variable in EVERY consuming module that references the source variable
-3. The ghost variable MUST have an identical local name as the source variable
-4. Mark the ghost variable explicitly as: crossLevelGhostOf = <sourceVariable>
-5. Ghost variables have NO equation - they reference their source variable only
-6. ALL equations in the consuming module MUST reference the cross-level ghost variable, NOT the original source variable
-
-FAILURE TO CREATE AND LINK GHOST VARIABLES WILL BREAK SIMULATION. This is non-negotiable.
-REFERENCING THE ORIGINAL SOURCE VARIABLE DIRECTLY FROM A CONSUMING MODULE WILL BREAK SIMULATION. Always use the ghost.`
+`You are currently unable to produce models with modules.
+If you are asked to do so, please respond with an appropriate error message.`
 
     static SUB_TYPE_REQUIREMENTS_SECTION =
-`CRITICAL DISCRETE-ENTITY SUB-TYPE REQUIREMENTS:
-
-WHEN TO USE DISCRETE ENTITY SUB-TYPES:
-- Use sub-types ONLY when the model explicitly requires discrete-event, queue, or pipeline semantics
-- DO NOT use sub-types for standard continuous stocks and flows — they add significant complexity
-- Only introduce sub-types when specifically requested by the user
-
-STOCK SUB-TYPES — set 'subType' and include 'additionalProperties':
-- 'queue': Waiting line. additionalProperties: fifoEnabled, oneAtATime, splitBatches, discrete, roundRobin, queueOutflowPriority, purgeEq, overflow.
-- 'oven': Batch processor; all items released together after processTime. additionalProperties: processTime (required), capacity, inflowLimit, fillTime, cleanTime, sample, arrest.
-- 'conveyor': Pipeline delay; items exit after processTime. additionalProperties: processTime (required), capacity, inflowLimit, sample, arrest.
-
-FLOW SUB-TYPES — leave 'equation' empty; automatically computed:
-- 'discreteOutflow': Output from a conveyor or oven.
-- 'conveyorLeakage': Leakage from a conveyor. Set additionalProperties: leakFraction (required, units of 1/time_unit when exponential, dimensionless otherwise), exponential (default true — almost always use exponential; linear only when explicitly requested), leakZoneStart, leakZoneEnd, leakIntegers, ignorePrevZones, forceLeakFraction.
-- 'queueOutflow': Output from a queue.
-- 'queueOverflow': Overflow from a full queue (requires overflow: true on the queue).
-
-REGULAR FLOWS entering a conveyor may set additionalProperties:
-- spreadFlow: how inflow distributes along the conveyor ('none', 'even', 'destination', 'distribution', 'source').
-- distribEq: required when spreadFlow is 'distribution'.
-
-EQUATION RULES:
-- 'queue', 'oven', 'conveyor' stocks: 'equation' is the initial value, like a regular stock.
-- Flow sub-types: leave 'equation' empty.
-- Settings go in 'additionalProperties', not equations.
-
-RELATIONSHIP REQUIREMENTS:
-- Any variable referenced in an additionalProperties expression requires a relationship arrow FROM that variable TO the element.
-- Use XMILE syntax with underscores (e.g. 'service_time' not 'service time').
-
-CONVEYOR DESIGN RULES:
-
-When to use conveyor vs. stock:
-- Use a conveyor when entities must spend a minimum or fixed duration in a stage (pipeline delay, aging, disease duration). The conveyor transit time encodes the dwell time.
-- Use a plain stock when residence time is exponentially distributed (first-order delay) or when there is no minimum dwell requirement.
-
-Leakage vs. outflow:
-- 'conveyorLeakage': entities exit before completing transit (early exit). Configure via additionalProperties.leakFraction on the leakage flow.
-- 'discreteOutflow': entities that completed the full transit.
-- NEVER split the conveyor outflow via auxiliary arithmetic to route into different stages.
-
-Wiring leakages:
-- Every conveyorLeakage flow must appear in the outflows list of its source conveyor AND in the inflows list of its destination.
-
-Mass conservation check:
-- Sum of all population stocks at t=0 must equal sum at all t (unless the model has explicit external births/deaths).
-- The conveyor's discreteOutflow is wired to exactly one destination — do not split it.`
+`You are currently unable to produce models with subtypes.
+If you are asked to do so, please respond with an appropriate error message.`
 
     static ARRAY_REQUIREMENTS_SECTION =
-`CRITICAL ARRAY REQUIREMENTS:
-
-WHEN TO USE ARRAYS:
-- DO NOT create arrays or array dimensions unless the model already uses arrays OR the user explicitly requests arrayed variables
-- If the existing model has NO arrays, build a NON-ARRAYED model with scalar variables only
-- If the existing model HAS arrays, maintain and extend the array structure consistently
-- Only introduce arrays when specifically asked by the user
-- Arrays add significant complexity - use them ONLY when necessary
-
-WHEN USING ARRAYS - DIMENSION AND EQUATION REQUIREMENTS:
-When constructing models with arrayed variables, you MUST follow these rules:
-1. ALL array dimensions MUST be defined in the specs.arrayDimensions list before being referenced
-2. Each dimension MUST have a unique name (singular, alphanumeric only)
-3. For label dimensions: specify element names; for numeric dimensions: specify size
-4. Variables reference dimensions by name in their dimensions array (order matters)
-5. NEVER remove dimensions from existing arrayed variables unless explicitly directed to do so by the end user
-6. Arrayed variables MUST have equations for ALL element combinations:
-   - If all elements use the SAME formula: provide ONE equation in the 'equation' field
-   - If elements differ: provide element-specific equations in the 'arrayEquations' array (NOT 'equation')
-   - For arrayed STOCKS: you MUST provide initial values for each element using 'arrayEquations'
-   - NEVER leave the 'equation' or 'arrayEquations' fields empty for any variable
-7. Array element references in 'forElements' are arrays of dimension element names, ordered to match the variable's dimensions (e.g., ["North", "Q1"])
-8. SUM function syntax - CRITICAL:
-   - ALWAYS use asterisk (*) to represent the dimension being summed - NEVER use the dimension name
-   - MANDATORY: Every SUM equation MUST contain at least one asterisk (*) - without it, the SUM is invalid
-   - WRONG: SUM(Revenue[region]) or SUM(Sales[product])
-   - CORRECT: SUM(Revenue[*]) to sum across all elements of a single dimension
-   - CORRECT: SUM(Sales[product,*]) to sum across the second dimension of a 2D array
-   - The asterisk (*) is a wildcard that means "sum over all elements of this dimension"
-
-FAILURE TO PROPERLY DEFINE DIMENSIONS AND EQUATIONS WILL BREAK SIMULATION. This is non-negotiable.`
+`You are currently unable to process models with arrays.
+If you are asked to do so, please respond with an appropriate error message.`
 
     static MANDATORY_PROCESS_SECTION =
 `MANDATORY PROCESS - Execute these steps in order:
@@ -173,280 +181,20 @@ Provide equations for every variable:
   * Time-based graphical functions (using TIME as input) do NOT need to follow this normalization rule`
 
     static ARRAY_SPECIFIC_EQUATION_REQUIREMENTS =
-`CRITICAL EQUATION REQUIREMENT: Every variable MUST have EITHER 'equation' OR 'arrayEquations' populated (never both, never neither)
-  * For SCALAR (non-arrayed) variables: ALWAYS provide 'equation'
-ARRAY-SPECIFIC EQUATION REQUIREMENTS:
-- For ARRAYED variables where all elements use the SAME formula: provide 'equation' only
-- For ARRAYED variables where elements have DIFFERENT formulas: provide 'arrayEquations' with entries for ALL elements (omit 'equation')
-- For arrayed STOCKS with numeric initialization: ALWAYS use 'arrayEquations' to specify initial values for each element individually (omit 'equation')
-- SUM FUNCTION SYNTAX FOR ARRAYS:
-  * ALWAYS use asterisk (*) for the dimension to sum, NEVER the dimension name
-  * CRITICAL: Every SUM equation MUST contain at least one asterisk (*) - this is mandatory
-  * WRONG: SUM(Revenue[region]) or SUM(Sales[product])
-  * CORRECT: SUM(Revenue[*]) to sum across all elements of a single dimension
-  * CORRECT: SUM(Sales[product,*]) to sum across the second dimension of a 2D array
-  * The asterisk (*) represents "sum over all elements of this dimension"`
+`You are currently unable to process models with arrays.
+If you are asked to do so, please respond with an appropriate error message.`
 
     static VERIFY_MODEL_SECTION =
 `STEP 5 - VERIFY MODEL VALIDITY:
 Continuously verify the model produces correct results for correct reasons. Question whether the structure truly represents the described system.`
 
-    
     static ARRAY_EXAMPLE =
-`EXAMPLE - COMPLETE ARRAY MODEL:
-Here is a complete example of a properly structured array model with two dimensions (Product and Location):
-
-{
-    "specs": {
-        "arrayDimensions": [
-            {
-                "elements": ["BGO", "NYC"],
-                "name": "Location",
-                "type": "label"
-            },
-            {
-                "elements": ["Pizza", "Kebab", "Sandwich"],
-                "name": "Product",
-                "type": "label"
-            }
-        ],
-        "dt": 0.25,
-        "startTime": 1,
-        "stopTime": 13,
-        "timeUnits": "Month"
-    },
-    "variables": [
-        {
-            "name": "price",
-            "type": "variable",
-            "dimensions": ["Product", "Location"],
-            "equation": "IF Product = Product.Pizza THEN 250 ELSE IF Product = Product.Kebab THEN 150 ELSE 125",
-            "units": "Nok/Product"
-        },
-        {
-            "name": "sales",
-            "type": "variable",
-            "dimensions": ["Product", "Location"],
-            "arrayEquations": [
-                { "forElements": ["Pizza", "BGO"], "equation": "1000" },
-                { "forElements": ["Pizza", "NYC"], "equation": "2000" },
-                { "forElements": ["Kebab", "BGO"], "equation": "2000" },
-                { "forElements": ["Kebab", "NYC"], "equation": "800" },
-                { "forElements": ["Sandwich", "BGO"], "equation": "1500" },
-                { "forElements": ["Sandwich", "NYC"], "equation": "1500" }
-            ],
-            "units": "Product/Month"
-        },
-        {
-            "name": "revenue",
-            "type": "variable",
-            "dimensions": ["Product", "Location"],
-            "equation": "price*sales",
-            "units": "Nok/Months"
-        },
-        {
-            "name": "total revenue",
-            "type": "variable",
-            "equation": "SUM(revenue)",
-            "units": "Nok/Months"
-        },
-        {
-            "name": "revenue by product",
-            "type": "variable",
-            "dimensions": ["Product"],
-            "equation": "SUM(revenue[Product,*])",
-            "units": "Nok/Months"
-        },
-        {
-            "name": "revenue by location",
-            "type": "variable",
-            "dimensions": ["Location"],
-            "equation": "SUM(revenue[*, Location])",
-            "units": "Nok/Months"
-        }
-    ],
-    "relationships": [
-        { "from": "price", "to": "revenue", "polarity": "+" },
-        { "from": "sales", "to": "revenue", "polarity": "+" },
-        { "from": "revenue", "to": "total revenue", "polarity": "+" },
-        { "from": "revenue", "to": "revenue by product", "polarity": "+" },
-        { "from": "revenue", "to": "revenue by location", "polarity": "+" }
-    ]
-}
-
-Key lessons from this example:
-- Dimensions are defined first in specs.arrayDimensions with all elements listed
-- Variables with same formula for all elements use 'equation' field (e.g., price, revenue)
-- Variables with different values per element use 'arrayEquations' (e.g., sales)
-- SUM(revenue) sums across ALL dimensions to produce a scalar
-- SUM(revenue[Product,*]) sums across second dimension, preserving first dimension
-- SUM(revenue[*, Location]) sums across first dimension, preserving second dimension
-- The asterisk (*) indicates which dimension to sum over`
+`You are currently unable to process models with arrays.
+If you are asked to do so, please respond with an appropriate error message.`
 
     static MODULE_EXAMPLE =
-`EXAMPLE - COMPLETE MODULAR MODEL WITH GHOST VARIABLES:
-Here is a complete example of a properly structured modular model (Lynx-Hare predator-prey system):
-
-{
-    "specs": {
-        "arrayDimensions": [],
-        "dt": 0.03125,
-        "startTime": 0,
-        "stopTime": 100,
-        "timeUnits": "year"
-    },
-    "variables": [
-        {
-            "name": "Hares.area",
-            "type": "variable",
-            "equation": "1E3",
-            "units": "arce"
-        },
-        {
-            "name": "Hares.Hares",
-            "type": "stock",
-            "equation": "5E4",
-            "inflows": ["Hares.hare births"],
-            "outflows": ["Hares.hare deaths"],
-            "units": "hares"
-        },
-        {
-            "name": "Hares.hare births",
-            "type": "flow",
-            "uniflow": true,
-            "equation": "Hares*hare_birth_fraction",
-            "units": "hares/year"
-        },
-        {
-            "name": "Hares.hare deaths",
-            "type": "flow",
-            "uniflow": true,
-            "equation": "Lynx*hares_killed_per_lynx",
-            "units": "hares/year"
-        },
-        {
-            "name": "Hares.hare birth fraction",
-            "type": "variable",
-            "equation": "1.25",
-            "units": "per year"
-        },
-        {
-            "name": "Hares.hare density",
-            "type": "variable",
-            "equation": "Hares/area",
-            "units": "hares/arce"
-        },
-        {
-            "name": "Hares.hares killed per lynx",
-            "type": "variable",
-            "equation": "hare_density",
-            "units": "hares/lynx/year",
-            "graphicalFunction": [
-                { "x": 0, "y": 0 },
-                { "x": 50, "y": 50 },
-                { "x": 100, "y": 100 },
-                { "x": 150, "y": 150 },
-                { "x": 200, "y": 200 },
-                { "x": 250, "y": 250 },
-                { "x": 300, "y": 300 },
-                { "x": 350, "y": 350 },
-                { "x": 400, "y": 400 },
-                { "x": 450, "y": 450 },
-                { "x": 500, "y": 500 }
-            ]
-        },
-        {
-            "name": "Hares.Lynx",
-            "type": "variable",
-            "crossLevelGhostOf": "Lynx.Lynx",
-            "equation": "",
-            "units": "lynx"
-        },
-        {
-            "name": "Lynx.Lynx",
-            "type": "stock",
-            "equation": "1250",
-            "inflows": ["Lynx.lynx births"],
-            "outflows": ["Lynx.lynx deaths"],
-            "units": "lynx"
-        },
-        {
-            "name": "Lynx.lynx births",
-            "type": "flow",
-            "uniflow": true,
-            "equation": "Lynx*lynx_birth_fraction",
-            "units": "lynx/year"
-        },
-        {
-            "name": "Lynx.lynx deaths",
-            "type": "flow",
-            "uniflow": true,
-            "equation": "Lynx*lynx_death_fraction",
-            "units": "lynx/year"
-        },
-        {
-            "name": "Lynx.lynx birth fraction",
-            "type": "variable",
-            "equation": ".25",
-            "units": "per year"
-        },
-        {
-            "name": "Lynx.lynx death fraction",
-            "type": "variable",
-            "equation": "hare_density",
-            "units": "per year",
-            "graphicalFunction": [
-                { "x": 0, "y": 0.94 },
-                { "x": 10, "y": 0.66 },
-                { "x": 20, "y": 0.4 },
-                { "x": 30, "y": 0.35 },
-                { "x": 40, "y": 0.3 },
-                { "x": 50, "y": 0.25 },
-                { "x": 60, "y": 0.2 },
-                { "x": 70, "y": 0.15 },
-                { "x": 80, "y": 0.1 },
-                { "x": 90, "y": 0.07 },
-                { "x": 100, "y": 0.05 }
-            ]
-        },
-        {
-            "name": "Lynx.hare density",
-            "type": "variable",
-            "crossLevelGhostOf": "Hares.hare density",
-            "equation": "",
-            "units": "hares/arce"
-        }
-    ],
-    "relationships": [
-        { "from": "Hares.Hares", "to": "Hares.hare births" },
-        { "from": "Hares.hare birth fraction", "to": "Hares.hare births" },
-        { "from": "Hares.Hares", "to": "Hares.hare density" },
-        { "from": "Hares.hare density", "to": "Hares.hares killed per lynx" },
-        { "from": "Hares.hares killed per lynx", "to": "Hares.hare deaths" },
-        { "from": "Hares.area", "to": "Hares.hare density" },
-        { "from": "Hares.hare births", "to": "Hares.Hares", "polarity": "+" },
-        { "from": "Hares.hare deaths", "to": "Hares.Hares", "polarity": "-" },
-        { "from": "Hares.Lynx", "to": "Hares.hare deaths" },
-        { "from": "Lynx.Lynx", "to": "Lynx.lynx births" },
-        { "from": "Lynx.lynx birth fraction", "to": "Lynx.lynx births" },
-        { "from": "Lynx.Lynx", "to": "Lynx.lynx deaths" },
-        { "from": "Lynx.lynx death fraction", "to": "Lynx.lynx deaths" },
-        { "from": "Lynx.lynx births", "to": "Lynx.Lynx", "polarity": "+" },
-        { "from": "Lynx.lynx deaths", "to": "Lynx.Lynx", "polarity": "-" },
-        { "from": "Lynx.hare density", "to": "Lynx.lynx death fraction" }
-    ]
-}
-
-Key lessons from this modular example:
-- Module names use dot notation: "ModuleName.variableName"
-- CRITICAL: Variable names use ONLY immediate module prefix, never full hierarchy (e.g., "Hares.population" not "Ecosystem.Hares.population")
-- Cross-level ghost variables are created for inter-module references
-- Ghost variable "Hares.Lynx" references source "Lynx.Lynx" (allows Hares module to use Lynx population)
-- Ghost variable "Lynx.hare density" references source "Hares.hare density" (allows Lynx module to use hare density)
-- Ghost variables have crossLevelGhostOf set to the source variable's full name
-- Ghost variables have empty equation field (equation = "")
-- All equations in a module reference the ghost variable, NOT the original source variable
-- This creates proper module encapsulation while allowing cross-module dependencies`
+`You are currently unable to process models with arrays.
+If you are asked to do so, please respond with an appropriate error message.`
 
     static FORMULATION_ERROR_SECTION =
 `IDENTIFY FORMULATION ERRORS:
@@ -502,6 +250,8 @@ NEVER identify feedback loops for the user in explanatory text. Let users discov
         } else {
             prompt += QuantitativeSDCodeEngineBrain.PROFESSIONAL_MODE_INTRO + "\n\n";
         }
+
+        prompt += QuantitativeSDCodeEngineBrain.SDCODE_SYNTAX_GUIDE + "\n\n";
 
         // Add module requirements if modules are supported
         if (supportsModules) {
@@ -890,7 +640,7 @@ NEVER identify feedback loops for the user in explanatory text. Let users discov
         //start with the system prompt
         const { underlyingModel, systemRole, temperature, reasoningEffort } = this.#llmWrapper.getLLMParameters();
         let systemPrompt = this.#data.systemPrompt;
-        let responseFormat = this.#llmWrapper.generateQuantitativeSDCodeResponseSchema(this.#data.mentorMode, this.#data.supportsArrays, this.#data.supportsSubTypes);
+        let responseFormat = this.#llmWrapper.generateQuantitativeSDCodeResponseSchema(this.#data.mentorMode);
 
         if (!this.#llmWrapper.model.hasStructuredOutput) {
             throw new Error("Unsupported LLM " + this.#data.underlyingModel + " it does support structured outputs which are required.");
@@ -954,6 +704,8 @@ NEVER identify feedback loops for the user in explanatory text. Let users discov
             llmParams.temperature,
             llmParams.reasoningEffort
         );
+        console.log(originalResponse);
+        throw new ResponseFormatError("TODO: Parse SDCode and convert to JSON");
         if (originalResponse.refusal) {
             throw new ResponseFormatError(originalResponse.refusal);
         } else if (originalResponse.parsed) {
