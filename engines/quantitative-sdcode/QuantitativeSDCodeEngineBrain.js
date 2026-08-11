@@ -10,6 +10,13 @@ class ResponseFormatError extends Error {
     }
 }
 
+class SDCodeError extends Error {
+    constructor(message, lineNum) {
+        super(`Error on line ${lineNum} - ${message}`);
+        this.name = "SDCodeError";
+    }
+}
+
 class QuantitativeSDCodeEngineBrain {
     static SDCODE_SYNTAX_GUIDE=
 `
@@ -25,19 +32,29 @@ Below is a sample program that highlights all of the syntax rules of SDCode.
 # append the comment directly to the end of the code line, to ensure it is recognized correctly.
 # Comments never directly affect how a simulation runs.
 
-### SIMULATION SETUP
-# The commands listed below set up the parameters that define how the model simulation should run.
+### STRINGS
+# Strings should always be delimited by double quotation marks "like this".
+# You CANNOT use double quotation marks inside strings, even with backslashing;
+# if you need to for whatever reason, use a single quotation mark instead " 'like this' ".
 
-setTimeUnits("year") # The unit of time for this model. This should match with the equations that you generate. Takes a string as its singular argument.
-setStartTime(0) # The time at which this model starts calculating. It is measured in the units of "timeUnits". Takes a number as its singular argument.
-setStartTime(10.0) # The time at which this model stops calculating. It is measured in the units of "timeUnits". Takes a number as its singular argument.
-setTimeStep(0.25) # The time step for the model, how often is it calculated. The most common dt is 0.25. It is measured in the units of "timeUnits". Takes a number as its singular argument.
-setIntegrationMethod("euler") # The method used to solve this model. The single required argument is either the string "euler" or "rk4". "euler" is the default, use "rk4" for systems with oscillations.
+### SIMULATION SETUP
+# The setup command listed below sets up the parameters that define how the model simulation should run.
+# All SDCode programs must include this command exactly once.
+# setup takes five required arguments. In order, they are:
+# timeUnits - A string indicating the unit of time for this model. This should match with the equations that you generate.
+# startTime - A number indicating the time at which this model starts calculating. It is measured in the units of "timeUnits".
+# stopTime - A number indicating the time at which this model stops calculating. It is measured in the units of "timeUnits". 
+# timeStep - A number indicating the time step for the model, how often is it calculated. The most common dt is 0.25. It is measured in the units of "timeUnits".
+# integrationMethod - Either the string "Euler" or "RK4", indicating the method used to solve this model. "Euler" is the default, Use "RK4" for systems with oscillations.
+setup("year", 0, 10.0, 0.25, "Euler")
 
 ### NAMING CONVENTIONS
 # Model components are identified by a unique name.
 # This name is allowed to comprise only of alphanumeric characters, the "_" character, and spaces.
 # Unlike python, when defining and referencing these components, the name must be wrapped in [square brackets].
+# Try to choose component names that are descriptive of the scenario;
+# for example, names like [foxes] or [fox count] are preferred over just [count],
+# and names like [book inventory] or [books] are preferred over [inventory].
 
 ### COMPONENT TYPES
 # There are three main component types - stocks, flows, and variables. 
@@ -47,9 +64,9 @@ setIntegrationMethod("euler") # The method used to solve this model. The single 
 
 ### CREATING VARIABLES
 # The single argument taken is a string describing the unit.
-[varA] = new Variable("units") # reasoning for creating [varA]
-[variable b] = new Variable("units") # reasoning for creating [variable b]
-[variable c] = new Variable("units") # reasoning for creating [variable c]
+[varA] = Variable("units") # reasoning for creating [varA]
+[variable b] = Variable("units") # reasoning for creating [variable b]
+[variable c] = Variable("units") # reasoning for creating [variable c]
 
 ### DEFINING EQUATIONS
 # Set the XMILE equation for a component with the .setEquation method. This takes one argument, the XMILE equation as a string.
@@ -57,7 +74,7 @@ setIntegrationMethod("euler") # The method used to solve this model. The single 
 # (although it does not need to be immediately after declaration).
 # This equation can be a number, or an algebraic expression of other variables.
 # Refer to other variables with their [bracketed] name. 
-# If the bracketed name contains spaces [like this], replace them with underscores [like_this].
+# IMPORTANT: If the bracketed name contains spaces [like this], replace them with underscores [like_this].
 # NEVER use IF THEN ELSE or conditional functions inside of equations. 
 # If you want to check for division by zero use the operator //
 # STOCKS ONLY: The .setEquation method sets the **initial value** of the stock. The equations for flows are automatically applied;
@@ -68,15 +85,15 @@ setIntegrationMethod("euler") # The method used to solve this model. The single 
 
 ### CREATING STOCKS
 # The single argument taken is a string describing the unit.
-[stockA] = new Stock("units")
+[stockA] = Stock("units")
 [stockA].setEquation("100") # [stockA] has an initial value of 100
-[stockB] = new Stock("units")
+[stockB] = Stock("units")
 [stockB].setEquation("0") # [stockB] has an initial value of 0
 
 ### CREATING FLOWS
 # The single argument taken is a string describing the unit.
-[flowA] = new Flow("units")
-[flowB] = new Flow("units")
+[flowA] = Flow("units")
+[flowB] = Flow("units")
 [flowA].setEquation("[variable_b]")
 [flowB].setEquation("[variable_c]*[stockA]")
 
@@ -94,29 +111,29 @@ setIntegrationMethod("euler") # The method used to solve this model. The single 
 # Use the .addInflow and .addOutflow methods on a stock to attach flows.
 # CRITICAL: A flow can never be both an inflow and outflow of the same stock.
 # (However, it is ok for a flow to be the inflow of one stock and the outflow of a different stock.)
-[stockA].setInflow([flowA])
-[stockA].setOutflow([flowB])
-[stockB].setInflow([flowB])
+[stockA].addInflow([flowA])
+[stockA].addOutflow([flowB])
+[stockB].addInflow([flowB])
 
 ### SPECIFYING RELATIONSHIPS
 # You should specify "cause-effect" relationships between every pair of components in the model.
 # To do so, use the .connect method, which is available on all components.
 # Call the .connect method on the "causal" component.
 # The .connect method takes two arguments; the first argument is the "effect" component and is REQUIRED, 
-# and the second is an OPTIONAL boolean that indicates the polarity of the relationship.
-# Set this to true if the relationship has positive polarity, and false if the relationship has negative polarity.
+# and the second is an number that indicates the polarity of the relationship.
+# Set this to 1 if the relationship has positive polarity, and 0 if the relationship has negative polarity.
 # In relationships with positive polarity (+) a change in the from variable causes a change in the same direction in the to variable.  For example, in a relationship with positive polarity (+), a decrease in the from variable, would lead to a decrease in the to variable.  The second kind of relationship are those with negative polarity that are represented with a - symbol.  In relationships with negative polarity (-) a change in the from variable causes a change in the opposite direction in the to variable.  For example, in a relationship with negative polarity (-) an increase in the from variable, would lead to a decrease in the to variable.
-# If it does not make sense to define a polarity for a relationship, do not pass a boolean at all.
+# If it does not make sense to define a polarity for a relationship, set this to -1 instead.
 # You can call the .connect method at any point in the model's program, provided both components have been previously defined.
-[varA].connect([variable b]) # the reasoning for this relationship
-[varA].connect([variable c])
-[variable b].connect([variable c])
-[variable b].connect([flowA])
-[variable c].connect([flowB])
-[stockA].connect([flowB])
-[flowA].connect([stockA], true)
-[flowB].connect([stockA], false)
-[flowB].connect([stockB], true)
+[varA].connect([variable b], -1) # the reasoning for this relationship
+[varA].connect([variable c], -1)
+[variable b].connect([variable c], -1)
+[variable b].connect([flowA], -1)
+[variable c].connect([flowB], -1)
+[stockA].connect([flowB], -1)
+[flowA].connect([stockA], 1)
+[flowB].connect([stockA], 0)
+[flowB].connect([stockB], 1)
 \`\`\`
 `
     static MODULE_REQUIREMENTS_SECTION =
@@ -245,36 +262,25 @@ NEVER identify feedback loops for the user in explanatory text. Let users discov
         let prompt = "";
 
         // Add intro based on mode
-        if (mentorMode) {
-            prompt += QuantitativeSDCodeEngineBrain.MENTOR_MODE_INTRO + "\n\n";
-        } else {
-            prompt += QuantitativeSDCodeEngineBrain.PROFESSIONAL_MODE_INTRO + "\n\n";
-        }
+        if (mentorMode) prompt += QuantitativeSDCodeEngineBrain.MENTOR_MODE_INTRO + "\n\n";
+        else            prompt += QuantitativeSDCodeEngineBrain.PROFESSIONAL_MODE_INTRO + "\n\n";
 
         prompt += QuantitativeSDCodeEngineBrain.SDCODE_SYNTAX_GUIDE + "\n\n";
 
         // Add module requirements if modules are supported
-        if (supportsModules) {
-            prompt += QuantitativeSDCodeEngineBrain.MODULE_REQUIREMENTS_SECTION + "\n\n";
-        }
+        if (supportsModules) prompt += QuantitativeSDCodeEngineBrain.MODULE_REQUIREMENTS_SECTION + "\n\n";
 
         // Add array requirements if arrays are supported
-        if (supportsArrays) {
-            prompt += QuantitativeSDCodeEngineBrain.ARRAY_REQUIREMENTS_SECTION + "\n\n";
-        }
+        if (supportsArrays) prompt += QuantitativeSDCodeEngineBrain.ARRAY_REQUIREMENTS_SECTION + "\n\n";
 
         // Add sub-type requirements if sub-types are supported
-        if (supportsSubTypes) {
-            prompt += QuantitativeSDCodeEngineBrain.SUB_TYPE_REQUIREMENTS_SECTION + "\n\n";
-        }
+        if (supportsSubTypes) prompt += QuantitativeSDCodeEngineBrain.SUB_TYPE_REQUIREMENTS_SECTION + "\n\n";
 
         // Always add mandatory process section
         prompt += QuantitativeSDCodeEngineBrain.MANDATORY_PROCESS_SECTION + "\n\n";
 
         // Add array-specific equation requirements if arrays are supported
-        if (supportsArrays) {
-            prompt += QuantitativeSDCodeEngineBrain.ARRAY_SPECIFIC_EQUATION_REQUIREMENTS + "\n\n";
-        }
+        if (supportsArrays) prompt += QuantitativeSDCodeEngineBrain.ARRAY_SPECIFIC_EQUATION_REQUIREMENTS + "\n\n";
 
         // Always add verify model section
         prompt += QuantitativeSDCodeEngineBrain.VERIFY_MODEL_SECTION;
@@ -288,13 +294,8 @@ NEVER identify feedback loops for the user in explanatory text. Let users discov
         }
 
         // Add examples based on what's supported
-        if (supportsArrays) {
-            prompt += "\n\n" + QuantitativeSDCodeEngineBrain.ARRAY_EXAMPLE;
-        }
-
-        if (supportsModules) {
-            prompt += "\n\n" + QuantitativeSDCodeEngineBrain.MODULE_EXAMPLE;
-        }
+        if (supportsArrays) prompt += "\n\n" + QuantitativeSDCodeEngineBrain.ARRAY_EXAMPLE;
+        if (supportsModules) prompt += "\n\n" + QuantitativeSDCodeEngineBrain.MODULE_EXAMPLE;
 
         return prompt;
     }
@@ -356,99 +357,6 @@ NEVER identify feedback loops for the user in explanatory text. Let users discov
         }
 
         this.#llmWrapper = new LLMWrapper(this.#data);
-
-    }
-
-    #filterInvalidRelationships(response, variablesByFoldedName) {
-        const origRelationships = response.relationships || [];
-        const seenPairs = new Set();
-        const validRelationships = [];
-
-        for (const relationship of origRelationships) {
-            const from = relationship.from.trim();
-            const to = relationship.to.trim();
-            const foldedFrom = projectUtils.caseFold(from);
-            const foldedTo = projectUtils.caseFold(to);
-
-            if (foldedFrom === foldedTo) continue;
-
-            const toVar = variablesByFoldedName.get(foldedTo);
-            if (!toVar || !variablesByFoldedName.has(foldedFrom)) continue;
-
-            if (toVar.crossLevelGhostOf && toVar.crossLevelGhostOf.length > 0) continue;
-
-            if (from.includes('[') || to.includes('[')) continue;
-
-            const pairKey = foldedFrom + '\x00' + foldedTo;
-            if (seenPairs.has(pairKey)) continue;
-            seenPairs.add(pairKey);
-
-            const cleaned = Object.assign({}, relationship);
-            cleaned.from = from;
-            cleaned.to = to;
-            validRelationships.push(cleaned);
-        }
-
-        response.relationships = validRelationships;
-    }
-
-    #cleanStockFlowsAndCollectUsage(stocks, variablesByFoldedName, usedFlowNames) {
-        const cleanList = (list) => {
-            const result = [];
-            for (const flowName of list) {
-                const cleaned = flowName.replace(/\[.*?\]/g, '').trim();
-                if (cleaned.length === 0) continue;
-                const folded = projectUtils.caseFold(cleaned);
-                if (!variablesByFoldedName.has(folded)) continue;
-                result.push(cleaned);
-                usedFlowNames.add(folded);
-            }
-            return result;
-        };
-
-        for (const v of stocks) {
-            if (Array.isArray(v.inflows)) v.inflows = cleanList(v.inflows);
-            if (Array.isArray(v.outflows)) v.outflows = cleanList(v.outflows);
-        }
-    }
-
-    #inferStockFlowsFromRelationships(response, variablesByFoldedName, usedFlowNames) {
-        // LLMs like gemini-3-flash-preview don't reliably emit inflow/outflow lists for stocks,
-        // so derive them from flow→stock relationships (polarity decides in vs out).
-        const flowSetsByStock = new Map();
-
-        const ensureSets = (stockVar) => {
-            let sets = flowSetsByStock.get(stockVar);
-            if (sets) return sets;
-            if (!stockVar.inflows) stockVar.inflows = [];
-            if (!stockVar.outflows) stockVar.outflows = [];
-            sets = {
-                inflows: new Set(stockVar.inflows.map(f => projectUtils.caseFold(f))),
-                outflows: new Set(stockVar.outflows.map(f => projectUtils.caseFold(f)))
-            };
-            flowSetsByStock.set(stockVar, sets);
-            return sets;
-        };
-
-        for (const relationship of response.relationships) {
-            const toVariable = variablesByFoldedName.get(projectUtils.caseFold(relationship.to));
-            if (!toVariable || toVariable.type !== 'stock') continue;
-            const fromVariable = variablesByFoldedName.get(projectUtils.caseFold(relationship.from));
-            if (!fromVariable || fromVariable.type !== 'flow') continue;
-
-            const sets = ensureSets(toVariable);
-            const foldedFromName = projectUtils.caseFold(fromVariable.name);
-            if (sets.inflows.has(foldedFromName) || sets.outflows.has(foldedFromName)) continue;
-
-            if (relationship.polarity === '-') {
-                toVariable.outflows.push(fromVariable.name);
-                sets.outflows.add(foldedFromName);
-            } else {
-                toVariable.inflows.push(fromVariable.name);
-                sets.inflows.add(foldedFromName);
-            }
-            usedFlowNames.add(foldedFromName);
-        }
     }
 
     #fixVariablesAndConvertEquations(response, usedFlowNames, variableNameMap, namesToConvert) {
@@ -524,106 +432,217 @@ NEVER identify feedback loops for the user in explanatory text. Let users discov
         }
     }
 
-    async #parseExplanation(response) {
-        if (response.explanation) {
-            response.explanation = await marked.parse(response.explanation);
+    #extractMethodArguments(methodCall, lineNum) {
+        // given a method call as a string such as "setEquation("...") # reasoning",
+        // extract the method name, arguments, and attached comment (if any).
+        const trimmed = methodCall.trim();
+        let idx = 0;
+        
+        const res = {
+            method: "",
+            args: [],
+            comment: ""
+        }
+        
+        // extract method name
+        while (idx < trimmed.length && trimmed[idx] !== "(") {
+            res.method += trimmed[idx];
+            idx++;
+        }
+        if (idx >= trimmed.length) throw new SDCodeError("syntax error (missing parentheses?)", lineNum);
+
+        // extract method args
+        idx++;
+        let leftIdx = idx;
+        let inString = false;
+        while (idx < trimmed.length && (inString || trimmed[idx] !== ")")) {
+            if (trimmed[idx] === "\"") inString = !inString;
+            idx++;
+        }
+        if (idx >= trimmed.length) throw new SDCodeError("syntax error (missing parentheses?)", lineNum);
+        const argsRaw = trimmed.slice(leftIdx, idx).split(",").map(s => s.trim());
+        inString = false;
+        for (const arg of argsRaw) {
+            if (inString) {
+                res.args[res.args.length - 1] += arg;
+                if (arg[arg.length - 1] === "\"") {
+                    inString = false;
+                    // remove closing quotation mark
+                    res.args[res.args.length - 1] = res.args[res.args.length - 1].slice(0, res.args[res.args.length - 1]);
+                } else {
+                    res.args[res.args.length - 1] += ",";
+                }
+            }
+            else if (arg.length === 0 || arg === "") continue; // blank argument
+            else if (arg[0] === "[") res.args.push(arg);
+            else if (arg[0] === "\"") {
+                if (arg.length > 1 && arg[arg.length-1] === "\"") res.args.push(arg.slice(1, arg.length - 1));
+                else {
+                    inString = true;
+                    res.args.push(arg + ",");
+                }
+            } else {
+                const parsedArg = parseFloat(arg);
+                if (isNaN(parsedArg)) {
+                    throw new SDCodeError(`syntax error (argument ${arg} is neither a number, component name, or string)`, lineNum);
+                }
+                res.args.push(parsedArg);
+            }
+        }
+
+        // extract comment
+        const remainder = trimmed.slice(idx);
+        if (remainder !== "") {
+            const hashtagIdx = remainder.indexOf("#");
+            if (hashtagIdx !== -1) {
+                res.comment = remainder.slice(hashtagIdx+1).trim();
+            }
+        }
+
+        return res;
+    }
+
+    #verifyArgumentTypes(args, types, lineNum) {
+        if (args.length !== types.length) {
+            throw new SDCodeError(`expected ${types.length} arguments but got ${args.length}`, lineNum);
+        }
+        for (const idx in args) {
+            const a = args[idx];
+            const b = types[idx];
+            if (Array.isArray(b)) {
+                if (!b.includes(a)) throw new SDCodeError(`argument ${idx+1} must be one of [${b.join(",")}], but got ${a}`, lineNum);
+            } else {
+                if (typeof(a) != typeof(b)) throw new SDCodeError(`argument ${idx+1} should be ${typeof(b)}, but got ${a}`, lineNum);
+            }
         }
     }
 
-    #mergeModules(response, usedModules, moduleNameMapping) {
-        if (!response.modules) response.modules = [];
-
-        // Single pass: build existing-modules lookup AND honor parentModule chains
-        // (a module referenced only as someone's parent is still in use).
-        const existingModulesMap = new Map();
-        for (const m of response.modules) {
-            if (m.name) {
-                const normalized = projectUtils.caseFold(m.name);
-                if (!existingModulesMap.has(normalized)) {
-                    existingModulesMap.set(normalized, m);
-                }
-            }
-            if (m.parentModule && m.parentModule.trim().length > 0) {
-                const normalizedParent = projectUtils.caseFold(m.parentModule);
-                usedModules.add(normalizedParent);
-                if (!moduleNameMapping.has(normalizedParent)) {
-                    moduleNameMapping.set(normalizedParent, m.parentModule);
-                }
-            }
+    #cleanComponentName(name, lineNum) {
+        if (name.length <= 2) throw new SDCodeError(`invalid component name ${name} (missing brackets + too short?)`, lineNum);
+        if (name[0] !== "[" || name[name.length-1] !== "]") {
+            throw new SDCodeError(`invalid component name ${name} (should be contained in [square brackets])`, lineNum);
         }
-
-        const newModules = [];
-        for (const normalized of usedModules) {
-            const existing = existingModulesMap.get(normalized);
-            if (existing) {
-                newModules.push(existing);
-            } else {
-                newModules.push({
-                    name: moduleNameMapping.get(normalized),
-                    parentModule: ""
-                });
-            }
+        const splicedName = name.slice(1, name.length-1);
+        if (!/^[a-zA-Z0-9_ ]+$/.test(splicedName)) {
+            throw new SDCodeError(`invalid component name ${name} (only alphanumeric chars, _, and spaces allowed`, lineNum);
         }
-
-        response.modules = newModules;
+        return splicedName.replaceAll(" ", "_"); // TODO: THIS IS A DUCT TAPE SOLUTION FIND A BETTER WAY TO DO THIS
     }
 
     async processResponse(originalResponse) {
-        originalResponse.variables = originalResponse.variables || [];
+        const program = originalResponse.program.split("\n").map(s => s.trim());
+        const explanation = await marked.parse(originalResponse.explanation);
 
-        // Pass 1: ONE walk over variables that builds every lookup structure the
-        // downstream helpers need — fold-name map, XMILE rename table, module
-        // usage, and a stocks-only list to avoid filtering again in pass 2.
-        const variablesByFoldedName = new Map();
-        const variableNameMap = new Map();   // raw name → xmile name (spaces → underscores)
-        const namesToConvert = [];           // raw names needing XMILE conversion
-        const usedModules = new Set();       // fold(moduleName) for any module referenced by a variable
-        const moduleNameMapping = new Map(); // fold(moduleName) → canonical capitalization
-        const stocks = [];
+        console.log(program);
 
-        for (const v of originalResponse.variables) {
-            if (!v.name) continue;
+        const simSpecs = {
+            startTime: null,
+            stopTime: null,
+            dt: null,
+            timeUnits: null,
+            integrationMethod: null,
+            arrayDimensions: [] // TODO
+        }
+        const mdl = {
+            variables: [],
+            relationships: [],
+            explanation: explanation,
+            title: originalResponse.title,
+            specs: simSpecs,
+            modules: [] // TODO
+        }
 
-            variablesByFoldedName.set(projectUtils.caseFold(v.name), v);
+        let lineNum = 0;
+        // TODO: This loop does NOT currently ensure the validity of the generated model.
+        for (const line of program) {
+            lineNum++;
+            if (line === "```") continue; // markdown backticks, ignore
+            if (line === "") continue; // blank line/newline, ignore
+            if (line[0] === "#") continue; // full comment line, ignore
 
-            if (v.type === 'stock') stocks.push(v);
+            // shorthand for lineParsed
+            const lp = this.#extractMethodArguments(line, lineNum);
+            // debug
+            // console.log(lp);
 
-            if (v.name.includes(' ')) {
-                variableNameMap.set(v.name, projectUtils.xmileName(v.name));
-                namesToConvert.push(v.name);
-            }
-
-            if (v.name.includes('.')) {
-                const parts = v.name.split('.');
-                for (let i = 0; i < parts.length - 1; i++) {
-                    const normalized = projectUtils.caseFold(parts[i]);
-                    usedModules.add(normalized);
-                    if (!moduleNameMapping.has(normalized)) {
-                        moduleNameMapping.set(normalized, parts[i]);
+            if (lp.method === "setup") {
+                if (simSpecs.startTime !== null) {
+                    // somehow simSpecs has already been setup?
+                    // either something has gone wrong or the LLM has put two setup commands for whatever reason
+                    throw new SDCodeError("duplicate setup command is not allowed", lineNum);
+                }
+                this.#verifyArgumentTypes(lp.args, ["", 0, 0, 0, ["Euler", "RK4"]], lineNum);
+                simSpecs.timeUnits = lp.args[0];
+                simSpecs.startTime = lp.args[1];
+                simSpecs.stopTime = lp.args[2];
+                simSpecs.dt = lp.args[3];
+                simSpecs.integrationMethod = lp.args[4];
+            } else if (lp.method.indexOf("=") !== -1) {
+                const eqIndex = lp.method.indexOf("=")
+                const compName = this.#cleanComponentName(lp.method.slice(0, eqIndex).trim(), lineNum);
+                const compType = lp.method.slice(eqIndex+1).trim();
+                this.#verifyArgumentTypes(lp.args, [""], lineNum);
+                if (compType !== "Stock" && compType !== "Flow" && compType !== "Variable") {
+                    throw new SDCodeError(`unrecognized component type ${compType}`, lineNum);
+                }
+                // TODO: VERIFY NAME IS NOT ALREADY TAKEN
+                mdl.variables.push({
+                    name: compName,
+                    equation: null, // TODO: ENFORCE THAT THIS IS SET LATER
+                    type: compType.toLowerCase(),
+                    documentation: lp.comment,
+                    units: lp.args[0],
+                    ...(compType.toLowerCase() === "stock" && 
+                        { inflows: [], outflows: [] }
+                    ),
+                    ...(compType.toLowerCase() === "flow" &&
+                        { uniflow: false } // default false, set to true later if .setUniflow() is called
+                    )
+                });
+            } else if (lp.method.indexOf(".") !== -1) {
+                const pdIndex = lp.method.indexOf(".");
+                const compName = this.#cleanComponentName(lp.method.slice(0, pdIndex).trim(), lineNum);
+                const compMethod = lp.method.slice(pdIndex+1).trim();
+                
+                // This is O(N) lookup, optimize later if necessary
+                let compObj = null;
+                for (const comp of mdl.variables) {
+                    if (comp.name === compName) {
+                        compObj = comp;
+                        break;
                     }
                 }
+                if (compObj === null) throw new SDCodeError(`component ${compName} is not defined`);
+                // ---
+
+                if (compMethod === "setEquation") {
+                    this.#verifyArgumentTypes(lp.args, [""], lineNum);
+                    compObj.equation = lp.args[0].replace(/\[([^\]]+)\]/g, (_, inner) => inner.replaceAll(" ", "_"))
+                } else if (compMethod === "setUniflow") {
+                    if (compObj.type !== "flow") throw new SDCodeError(`component ${compName} is not flow`);
+                    compObj.uniflow = true;
+                } else if (compMethod === "addInflow" || compMethod === "addOutflow") {
+                    if (compObj.type !== "stock") throw new SDCodeError(`component ${compName} is not stock`);
+                    this.#verifyArgumentTypes(lp.args, [""], lineNum);
+                    const secondComp = this.#cleanComponentName(lp.args[0], lineNum);
+                    // TODO: WE DON'T CHECK IF THIS COMPONENT ACTUALLY EXISTS, IF ITS BOTH INFLOW AND OUTFLOW, ETC.
+                    if (compMethod === "addInflow") compObj.inflows.push(secondComp);
+                    else compObj.outflows.push(secondComp);
+                } else if (compMethod === "connect") {
+                    this.#verifyArgumentTypes(lp.args, ["", [-1, 0, 1]], lineNum);
+                    mdl.relationships.push({
+                        from: compName,
+                        to: this.#cleanComponentName(lp.args[0], lineNum),
+                        ...(lp.args[1] !== -1 && { polarity: lp.args[1] === 1 ? "+" : "-" }),
+                        reasoning: lp.comment
+                    })
+                }
+            } else {
+                throw new SDCodeError(`couldn't recognize this method call ${lp.method}`, lineNum);
             }
         }
 
-        this.#filterInvalidRelationships(originalResponse, variablesByFoldedName);
-
-        // Pass 2: walk stocks only — clean inflow/outflow refs and seed the
-        // used-flow set. #inferStockFlowsFromRelationships then adds any
-        // additional flows it derives from relationships.
-        const usedFlowNames = new Set();
-        this.#cleanStockFlowsAndCollectUsage(stocks, variablesByFoldedName, usedFlowNames);
-        this.#inferStockFlowsFromRelationships(originalResponse, variablesByFoldedName, usedFlowNames);
-
-        // Pass 3: combined per-variable mutation pass — flow-type fixup,
-        // DT→TIME, forElements normalization, and XMILE rewriting.
-        this.#fixVariablesAndConvertEquations(originalResponse, usedFlowNames, variableNameMap, namesToConvert);
-
-        // No variable loop needed — module usage was already collected in pass 1.
-        this.#mergeModules(originalResponse, usedModules, moduleNameMapping);
-
-        await this.#parseExplanation(originalResponse);
-
-        return originalResponse;
+        return mdl;
     }
 
     mentor() {
@@ -637,7 +656,7 @@ NEVER identify feedback loops for the user in explanatory text. Let users discov
     }
 
     setupLLMParameters(userPrompt, lastModel) {
-        //start with the system prompt
+        // build system prompt
         const { underlyingModel, systemRole, temperature, reasoningEffort } = this.#llmWrapper.getLLMParameters();
         let systemPrompt = this.#data.systemPrompt;
         let responseFormat = this.#llmWrapper.generateQuantitativeSDCodeResponseSchema(this.#data.mentorMode);
@@ -666,13 +685,13 @@ NEVER identify feedback loops for the user in explanatory text. Let users discov
 
         // Check if lastModel has actual content (variables or relationships)
         if (lastModel && (lastModel.variables?.length > 0 || lastModel.relationships?.length > 0)) {
+            // TODO: convert this to SDCode
             messages.push({ role: "assistant", content: JSON.stringify(lastModel, null, 2) });
 
-            if (this.#data.assistantPrompt)
-                messages.push({ role: "user", content: this.#data.assistantPrompt });
+            if (this.#data.assistantPrompt) messages.push({ role: "user", content: this.#data.assistantPrompt });
         }
 
-        //give it the user prompt
+        // Give it the user prompt
         messages.push({ role: "user", content: userPrompt });
 
         return {
@@ -695,8 +714,6 @@ NEVER identify feedback loops for the user in explanatory text. Let users discov
         }
 
         const llmParams = this.setupLLMParameters(userPrompt, lastModel);
-
-        //get what it thinks the relationships are with this information
         const originalResponse = await this.#llmWrapper.createChatCompletion(
             llmParams.messages,
             llmParams.model,
@@ -704,14 +721,16 @@ NEVER identify feedback loops for the user in explanatory text. Let users discov
             llmParams.temperature,
             llmParams.reasoningEffort
         );
-        console.log(originalResponse);
-        throw new ResponseFormatError("TODO: Parse SDCode and convert to JSON");
+
+        // debug
+        // console.log(originalResponse);
+
         if (originalResponse.refusal) {
             throw new ResponseFormatError(originalResponse.refusal);
         } else if (originalResponse.parsed) {
             return this.processResponse(originalResponse.parsed);
         } else if (originalResponse.content) {
-            let parsedObj = {variables: [], relationships: []};
+            let parsedObj = { program: "", explanation: "" };
             try {
                 parsedObj = JSON.parse(originalResponse.content);
             } catch (err) {
