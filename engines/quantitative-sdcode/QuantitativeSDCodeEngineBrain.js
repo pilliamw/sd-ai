@@ -50,11 +50,11 @@ setup("year", 0, 10.0, 0.25, "Euler")
 
 ### NAMING CONVENTIONS
 # Model components are identified by a unique name.
-# This name is allowed to comprise only of alphanumeric characters, the "_" character, and spaces.
+# This name is allowed to comprise only of alphanumeric characters and the "_" character.
 # Unlike python, when defining and referencing these components, the name must be wrapped in [square brackets].
 # Try to choose component names that are descriptive of the scenario;
-# for example, names like [foxes] or [fox count] are preferred over just [count],
-# and names like [book inventory] or [books] are preferred over [inventory].
+# for example, names like [foxes] or [fox_count] are preferred over just [count],
+# and names like [book_inventory] or [books] are preferred over [inventory].
 
 ### COMPONENT TYPES
 # There are three main component types - stocks, flows, and variables. 
@@ -65,23 +65,22 @@ setup("year", 0, 10.0, 0.25, "Euler")
 ### CREATING VARIABLES
 # The single argument taken is a string describing the unit.
 [varA] = Variable("units") # reasoning for creating [varA]
-[variable b] = Variable("units") # reasoning for creating [variable b]
-[variable c] = Variable("units") # reasoning for creating [variable c]
+[variable_b] = Variable("units") # reasoning for creating [variable_b]
+[variable_c] = Variable("units") # reasoning for creating [variable_c]
 
 ### DEFINING EQUATIONS
 # Set the XMILE equation for a component with the .setEquation method. This takes one argument, the XMILE equation as a string.
 # Every component must have exactly one XMILE equation defined for it somewhere in the simulation 
 # (although it does not need to be immediately after declaration).
 # This equation can be a number, or an algebraic expression of other variables.
-# Refer to other variables with their [bracketed] name. 
-# IMPORTANT: If the bracketed name contains spaces [like this], replace them with underscores [like_this].
+# Refer to other variables with their name.
 # NEVER use IF THEN ELSE or conditional functions inside of equations. 
 # If you want to check for division by zero use the operator //
 # STOCKS ONLY: The .setEquation method sets the **initial value** of the stock. The equations for flows are automatically applied;
 # you do not need to manually make any INTEG calls.
 [varA].setEquation("10") # [varA] is set to the numeric value of 10
-[variable b].setEquation("5*[varA]") # [variable b] is set to be 5 times [varA]
-[variable c].setEquation("[varA] + [variable_b]") # [variable c] is set to be the sum of [varA] and [variable b]
+[variable_b].setEquation("5*varA") # [variable_b] is set to be 5 times [varA]
+[variable_c].setEquation("varA + variable_b") # [variable_c] is set to be the sum of [varA] and [variable_b]
 
 ### CREATING STOCKS
 # The single argument taken is a string describing the unit.
@@ -94,8 +93,8 @@ setup("year", 0, 10.0, 0.25, "Euler")
 # The single argument taken is a string describing the unit.
 [flowA] = Flow("units")
 [flowB] = Flow("units")
-[flowA].setEquation("[variable_b]")
-[flowB].setEquation("[variable_c]*[stockA]")
+[flowA].setEquation("variable_b")
+[flowB].setEquation("variable_c*stockA")
 
 ### UNIFLOW FLOWS
 # By default, all flows are bi-directional.
@@ -125,11 +124,11 @@ setup("year", 0, 10.0, 0.25, "Euler")
 # In relationships with positive polarity (+) a change in the from variable causes a change in the same direction in the to variable.  For example, in a relationship with positive polarity (+), a decrease in the from variable, would lead to a decrease in the to variable.  The second kind of relationship are those with negative polarity that are represented with a - symbol.  In relationships with negative polarity (-) a change in the from variable causes a change in the opposite direction in the to variable.  For example, in a relationship with negative polarity (-) an increase in the from variable, would lead to a decrease in the to variable.
 # If it does not make sense to define a polarity for a relationship, set this to -1 instead.
 # You can call the .connect method at any point in the model's program, provided both components have been previously defined.
-[varA].connect([variable b], -1) # the reasoning for this relationship
-[varA].connect([variable c], -1)
-[variable b].connect([variable c], -1)
-[variable b].connect([flowA], -1)
-[variable c].connect([flowB], -1)
+[varA].connect([variable_b], -1) # the reasoning for this relationship
+[varA].connect([variable_c], -1)
+[variable_b].connect([variable_c], -1)
+[variable_b].connect([flowA], -1)
+[variable_c].connect([flowB], -1)
 [stockA].connect([flowB], -1)
 [flowA].connect([stockA], 1)
 [flowB].connect([stockA], 0)
@@ -655,6 +654,39 @@ NEVER identify feedback loops for the user in explanatory text. Let users discov
         );
     }
 
+    #convertToSDCode(model) {
+        const declarations = [];
+        const methodCalls = [];
+        // TODO: ARRANGE IN LOGICAL MANNER
+        for (const varObj of model.variables) {
+            declarations.push(`[${varObj.name}] = ${varObj.type[0].toUpperCase() + varObj.type.slice(1)}("${varObj.units ?? "units"}")`);
+            methodCalls.push(`[${varObj.name}].setEquation("${varObj.equation}")`);
+            if (varObj.type === "flow" && varObj.uniflow) {
+                methodCalls.push(`[${varObj.name}].setUniflow()`);
+            }
+            if (varObj.type === "stock") {
+                if (varObj.inflows !== undefined) {
+                    for (const inflow of varObj.inflows) {
+                        methodCalls.push(`[${varObj.name}].addInflow([${inflow}])`);
+                    }
+                }
+                if (varObj.outflows !== undefined) {
+                    for (const outflow of varObj.outflows) {
+                        methodCalls.push(`[${varObj.name}].addOutflow([${outflow}])`);
+                    }
+                }
+            }
+        }
+        // long one-liner; apologies
+        const program = [`setup("${model.specs.timeUnits ?? "day"}", ${model.specs.startTime ?? 0}, ${model.specs.stopTime ?? 10.0}, ${model.specs.dt ?? 0.25}, "${model.specs.integrationMethod ?? "Euler"}")`]
+            .concat(declarations.concat(methodCalls));
+        for (const relObj of model.relationships) {
+            program.push(`[${relObj.from}].connect(${relObj.to}, ${(relObj.polarity === undefined ? -1 : (relObj.polarity === "+" ? 1 : 0))})`);
+        }
+        console.log(program);
+        return "```\n" + program.join("\n") + "```"; 
+    }
+    
     setupLLMParameters(userPrompt, lastModel) {
         // build system prompt
         const { underlyingModel, systemRole, temperature, reasoningEffort } = this.#llmWrapper.getLLMParameters();
@@ -686,7 +718,13 @@ NEVER identify feedback loops for the user in explanatory text. Let users discov
         // Check if lastModel has actual content (variables or relationships)
         if (lastModel && (lastModel.variables?.length > 0 || lastModel.relationships?.length > 0)) {
             // TODO: convert this to SDCode
-            messages.push({ role: "assistant", content: JSON.stringify(lastModel, null, 2) });
+            messages.push({ 
+                role: "assistant", 
+                content: JSON.stringify({ 
+                    program: this.#convertToSDCode(lastModel),
+                    explanation: ""
+                }, null, 2)
+            });
 
             if (this.#data.assistantPrompt) messages.push({ role: "user", content: this.#data.assistantPrompt });
         }

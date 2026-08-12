@@ -14,7 +14,10 @@
         }
     },
     "categories": {
+        "quantitativeIteration": true,
         "quantitativeTranslation": true,
-        "quantitativeCausalReasoning": true
+        "quantitativeCausalReasoning": true,
+        "quantitativeErrorFixing": true,
+        "conformance": true
     }
 }
