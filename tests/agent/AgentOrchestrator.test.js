@@ -1037,7 +1037,9 @@ describe('sandbox write gating — manual execute paths', () => {
 
   it('lets a granted manual-mode agent write — the flag is authoritative off the SDK route too', async () => {
     const orc = makeAgent('can_write_to_local_sandbox: true\n');
-    const target = path.join(tmpDir, 'allowed.txt');
+    // Inside the session dir: the grant says whether this agent may write at all,
+    // and the tool's own confinement says where. Both have to pass.
+    const target = path.join(sessionManager.getSessionTempDir(sessionId), 'allowed.txt');
 
     const result = await orc.executeToolCallHelper(
       { name: 'write_file', input: { filePath: target, content: 'landed' } },
@@ -1046,6 +1048,54 @@ describe('sandbox write gating — manual execute paths', () => {
 
     expect(result.isError).toBeFalsy();
     expect(fs.readFileSync(target, 'utf-8')).toBe('landed');
+  });
+
+  // The grant is not a licence to write anywhere. bwrap makes /app read-only but
+  // leaves /tmp and the session bind mount writable, so without this the only
+  // boundary on a granted agent's writes lives outside the process.
+  it('refuses a granted agent a write outside the session directory', async () => {
+    const orc = makeAgent('can_write_to_local_sandbox: true\n');
+    const target = path.join(tmpDir, 'escaped.txt');
+
+    const result = await orc.executeToolCallHelper(
+      { name: 'write_file', input: { filePath: target, content: 'should never land' } },
+      orc.builtInToolProvider.getTools()
+    );
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toMatch(/outside the session directory/);
+    expect(fs.existsSync(target)).toBe(false);
+  });
+
+  it('refuses a granted agent an edit outside the session directory', async () => {
+    const orc = makeAgent('can_write_to_local_sandbox: true\n');
+    const target = path.join(tmpDir, 'outside.txt');
+    fs.writeFileSync(target, 'original', 'utf-8');
+
+    const result = await orc.executeToolCallHelper(
+      { name: 'edit_file', input: { filePath: target, oldString: 'original', newString: 'tampered' } },
+      orc.builtInToolProvider.getTools()
+    );
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toMatch(/outside the session directory/);
+    expect(fs.readFileSync(target, 'utf-8')).toBe('original');
+  });
+
+  // A traversal out of a legitimate-looking root must be resolved before the
+  // comparison, not after — see pathConfinement.canonical.
+  it('refuses a write that walks out of the session directory with ..', async () => {
+    const orc = makeAgent('can_write_to_local_sandbox: true\n');
+    const sessionDir = sessionManager.getSessionTempDir(sessionId);
+    const target = path.join(sessionDir, '..', '..', 'traversed.txt');
+
+    const result = await orc.executeToolCallHelper(
+      { name: 'write_file', input: { filePath: target, content: 'should never land' } },
+      orc.builtInToolProvider.getTools()
+    );
+
+    expect(result.isError).toBe(true);
+    expect(fs.existsSync(path.resolve(target))).toBe(false);
   });
 
   it('advertises the write tools to a granted manual-mode agent', async () => {
@@ -1064,7 +1114,9 @@ describe('sandbox write gating — manual execute paths', () => {
   });
 
   it('never refuses a read, whichever way the flag is set', async () => {
-    const target = path.join(tmpDir, 'data.csv');
+    // Inside the session temp dir: read_file is scoped to that dir plus the app
+    // dir, so this is where a data file a tool told the model to read lives.
+    const target = path.join(sessionManager.getSessionTempDir(sessionId), 'data.csv');
     fs.writeFileSync(target, 'time,value\n0,1\n', 'utf-8');
 
     for (const grant of ['', 'can_write_to_local_sandbox: true\n']) {
@@ -1075,6 +1127,32 @@ describe('sandbox write gating — manual execute paths', () => {
       );
       expect(result.isError).toBeFalsy();
     }
+  });
+
+  // read_file is available to every agent with no capability gate, so without a
+  // scope it is an arbitrary host-filesystem read whose only boundary is bwrap —
+  // which does not exist on dev machines.
+  it('refuses a read outside the session and app directories', async () => {
+    const target = path.join(tmpDir, 'outside.csv');
+    fs.writeFileSync(target, 'secret\n', 'utf-8');
+
+    const orc = makeAgent('can_write_to_local_sandbox: true\n');
+    const result = await orc.executeToolCallHelper(
+      { name: 'read_file', input: { filePath: target } },
+      orc.builtInToolProvider.getTools()
+    );
+    expect(result.isError).toBeTruthy();
+  });
+
+  it('refuses a traversal out of the session directory', async () => {
+    const escape = path.join(sessionManager.getSessionTempDir(sessionId), '..', '..', '..', '..', 'etc', 'passwd');
+
+    const orc = makeAgent('');
+    const result = await orc.executeToolCallHelper(
+      { name: 'read_file', input: { filePath: escape } },
+      orc.builtInToolProvider.getTools()
+    );
+    expect(result.isError).toBeTruthy();
   });
 
   it('applies the same refusal on the Gemini manual path', async () => {
@@ -1184,5 +1262,123 @@ describe('startConversationOpenAiCompatibleManual — request shape', () => {
     const firstRequest = create.mock.calls[0][0];
     expect(firstRequest.model).toBe(TEST_NATIVE_PROVIDERS.deepseek.model);
     expect(firstRequest.reasoning_effort).toBeUndefined();
+  });
+});
+
+// ─── native OpenAI-compatible manual loop — usage reporting ──────────────────
+//
+// One report per request, never a total held back to the end of the run. The loop
+// used to keep only the latest usage and report it once on the way out, which billed
+// a five-turn conversation for its fifth turn — and billed a run the user stopped for
+// whichever turn happened to be last before the break. Per-request is also the only
+// shape openai's pricing tiers accept: they charge by the size of one prompt, and a
+// summed input count crosses the 272K long-context line no single request went near.
+
+describe('startConversationOpenAiCompatibleManual — usage reporting', () => {
+  let sessionManager;
+  let sessionId;
+  let orc;
+  let create;
+
+  const FIRST_USAGE = {
+    prompt_tokens: 100,
+    completion_tokens: 20,
+    prompt_tokens_details: { cached_tokens: 10, cache_write_tokens: 5 },
+  };
+  const SECOND_USAGE = {
+    prompt_tokens: 200,
+    completion_tokens: 30,
+    prompt_tokens_details: { cached_tokens: 100, cache_write_tokens: 0 },
+  };
+
+  function toolCallTurn(usage) {
+    return {
+      choices: [{
+        message: {
+          content: null,
+          tool_calls: [{ id: 'tc_1', type: 'function', function: { name: 'my_tool', arguments: '{}' } }]
+        }
+      }],
+      usage,
+    };
+  }
+
+  function makeNativeOrchestrator(provider) {
+    process.env.OPENAI_API_KEY = 'dummy';
+    process.env.DEEPSEEK_API_KEY = 'dummy';
+    const sendToClient = jest.fn().mockResolvedValue(undefined);
+    const o = new AgentOrchestrator(sessionManager, sessionId, sendToClient, CONFIG, provider);
+    o.executeToolCallHelper = jest.fn().mockResolvedValue(BLOCK_RESULT);
+    o.openAiCompatibleClient = { chat: { completions: { create } } };
+    o.tokenReporter = { report: jest.fn().mockResolvedValue(undefined) };
+    return o;
+  }
+
+  function reports(o) {
+    return o.tokenReporter.report.mock.calls.map(([call]) => call);
+  }
+
+  beforeEach(() => {
+    sessionManager = new SessionManager();
+    sessionId = sessionManager.createSession(null);
+    sessionManager.initializeSession(sessionId, 'cld', {}, [], {}, 'test-client');
+    create = jest.fn();
+  });
+
+  afterEach(() => {
+    orc.destroy();
+    sessionManager.shutdown();
+  });
+
+  it('reports each turn as its own request rather than one total at the end', async () => {
+    create
+      .mockResolvedValueOnce(toolCallTurn(FIRST_USAGE))
+      .mockResolvedValueOnce({ choices: [{ message: { content: 'All done', tool_calls: [] } }], usage: SECOND_USAGE });
+    orc = makeNativeOrchestrator('openai');
+
+    await orc.startConversationOpenAiCompatibleManual('build me a model');
+
+    expect(reports(orc)).toEqual([
+      { provider: 'openai', model: TEST_NATIVE_PROVIDERS.openai.model, usage: FIRST_USAGE, clientKey: false },
+      { provider: 'openai', model: TEST_NATIVE_PROVIDERS.openai.model, usage: SECOND_USAGE, clientKey: false },
+    ]);
+  });
+
+  it('reports the turn in flight when the user stops mid-loop', async () => {
+    create
+      .mockResolvedValueOnce(toolCallTurn(FIRST_USAGE))
+      .mockImplementationOnce(async () => {
+        // The stop lands while this turn is in flight. It completed upstream, so
+        // its tokens are on the bill whether or not the loop goes another round.
+        orc.stopIteration();
+        return { choices: [{ message: { content: 'half an answer', tool_calls: [] } }], usage: SECOND_USAGE };
+      });
+    orc = makeNativeOrchestrator('deepseek');
+
+    await orc.startConversationOpenAiCompatibleManual('build me a model');
+
+    expect(reports(orc).map(r => r.usage)).toEqual([FIRST_USAGE, SECOND_USAGE]);
+    // deepseek bills on its own table, not openai's — the usage shapes differ too.
+    expect(reports(orc).every(r => r.provider === 'deepseek')).toBe(true);
+  });
+
+  it('reports what the run spent before a request failed', async () => {
+    create
+      .mockResolvedValueOnce(toolCallTurn(FIRST_USAGE))
+      .mockRejectedValueOnce(new Error('upstream exploded'));
+    orc = makeNativeOrchestrator('openai');
+
+    await orc.startConversationOpenAiCompatibleManual('build me a model');
+
+    expect(reports(orc).map(r => r.usage)).toEqual([FIRST_USAGE]);
+  });
+
+  it('reports nothing for a run that never reached the API', async () => {
+    create.mockRejectedValueOnce(new Error('upstream exploded'));
+    orc = makeNativeOrchestrator('openai');
+
+    await orc.startConversationOpenAiCompatibleManual('build me a model');
+
+    expect(orc.tokenReporter.report).not.toHaveBeenCalled();
   });
 });

@@ -46,6 +46,7 @@ import {
 } from './utilities/MessageProtocol.js';
 import logger from '../utilities/logger.js';
 import config from '../config.js';
+import { resolveLevel, supportsIntelligence } from './utilities/intelligenceLevels.js';
 import TokenUsageReporter, { Provider } from '../utilities/TokenUsageReporter.js';
 import { sanitizeSchemaForGemini } from './tools/builtin/toolHelpers.js';
 import {
@@ -56,6 +57,8 @@ import {
   usageProviderFor
 } from './utilities/nativeProviders.js';
 import { isToolAvailable } from './tools/toolAvailability.js';
+import { APP_ROOT, createSdkFilesystemGuard } from './tools/pathConfinement.js';
+import { createSdkNetworkGuard } from './tools/networkConfinement.js';
 import { join } from 'path';
 
 // External provider ids that name the upstream LLM brand but resolve to the same
@@ -81,6 +84,54 @@ const OPENROUTER_PROVIDERS = new Set(Object.keys(config.openRouterAgentProviders
 // Bash is here because a shell is a write tool: withdrawing Write and Edit while
 // leaving `bash -c 'echo ... > f'` in reach would restrict nothing.
 const SDK_WRITE_TOOLS = ['Write', 'Edit', 'NotebookEdit', 'Bash'];
+
+// The preset's web half, which every agent gets — read-only ones included, since
+// neither name is in SDK_WRITE_TOOLS above. Listed here rather than left implicit
+// because that availability was previously a side effect of what the deny list
+// happened to omit, and something reachable by accident is something that gets
+// removed by accident too. Naming them in allowedTools does not grant anything
+// (the preset already did) but it puts the decision in the file.
+//
+// What bounds them is createSdkNetworkGuard, not this list: the sandbox shares
+// the host's network namespace, so an unrestricted fetch is a request aimed at
+// the host's own loopback and at the cloud metadata service. See
+// tools/networkConfinement.js.
+const SDK_WEB_TOOLS = ['WebFetch', 'WebSearch'];
+
+// The environment the Agent SDK gives the `claude` CLI subprocess it spawns.
+//
+// Without this the subprocess inherits the worker's process.env, which is how
+// `Bash` running `env` — and `Read` on /proc/self/environ, which needs no write
+// capability at all — returned every provider key the worker held. An explicit
+// allowlist is the only thing that narrows it; the SDK documents the option as
+// "when omitted, the subprocess inherits process.env".
+//
+// ANTHROPIC_API_KEY is on the list and is safe to be: WorkerSpawner replaces it
+// with a per-session sentinel that only the loopback CredentialProxy will
+// exchange for the real credential. The rest are transport and locale settings a
+// proxied or custom-CA deployment needs; none is a secret.
+const SDK_SUBPROCESS_ENV = [
+  'PATH', 'HOME', 'SHELL', 'LANG', 'LC_ALL', 'TMPDIR', 'TERM',
+  'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL',
+  'NODE_EXTRA_CA_CERTS',
+  'HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY',
+  'http_proxy', 'https_proxy', 'no_proxy',
+];
+
+export function anthropicSdkSubprocessEnv() {
+  const env = {};
+  for (const name of SDK_SUBPROCESS_ENV) {
+    if (process.env[name] !== undefined) env[name] = process.env[name];
+  }
+  return env;
+}
+
+// Neutralize regex metacharacters in text that is about to become a pattern. Used on
+// tool names, which are client-supplied on the dynamic side and so are not guaranteed
+// to be the plain [a-z0-9_] identifiers the convention implies.
+function escapeRegExp(text) {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
 
 // Normalize a single message to Gemini format {role:'user'|'model', parts:[{text}]}.
 // Handles Anthropic-format messages ({role, content}) that arrive when switching
@@ -135,11 +186,14 @@ export class AgentOrchestrator {
   // yield). No LLM-call id is exposed on the event, so reference equality is the
   // only available dedup key.
   #geminiAdkReportedUsageMetadata = new WeakSet();
-  // Latest usage seen from a `response.completed` event on the OpenRouter SDK
-  // stream. The SDK delivers cumulative usage per response, so the *last* one
-  // we see is the authoritative total. Reported once when the loop completes
-  // (or aborts) — never per-event, which would double-count.
-  #openRouterSdkPendingUsage = null;
+  // Running usage total for the OpenRouter conversation currently in flight, shared
+  // by both loops (a session runs one of them, never both). OpenRouter bills one HTTP
+  // request at a time — the SDK loop sees a `response.completed` per turn, the manual
+  // loop a usage block per chat.send — so no single usage object is the run's total
+  // and they are summed as they arrive. Flushed and cleared at every exit from either
+  // loop: normal completion, user stop, abort and error alike, so a run that ends
+  // early still reports every token it spent up to that point.
+  #openRouterPendingUsage = null;
   // Upstream error block from a `response.failed` event on the OpenRouter SDK
   // stream. The SDK's own handler for that event reads `event.message`, which
   // does not exist — the detail lives at `event.response.error` — so it throws a
@@ -148,12 +202,6 @@ export class AgentOrchestrator {
   // events are always drained before the completion error surfaces, so we can
   // stash the real reason here and attach it when that error reaches the catch.
   #openRouterSdkFailureDetail = null;
-  // Latest usage seen from a the OpenRouter manual pathway. This pathway delivers 
-  // cumulative usage per response, so the *last* one
-  // we see is the authoritative total. Reported once when the loop completes
-  // (or aborts) — never per-event, which would double-count.
-  #openRouterManualPendingUsage = null;
-  #openAiCompatibleManualPendingUsage = null;
   // Per-assistant usage accumulator for the anthropic SDK route. The SDKResultMessage
   // carries the authoritative aggregate and supersedes this on normal completion;
   // we only flush the accumulator as a fallback when a query aborts before its
@@ -165,12 +213,22 @@ export class AgentOrchestrator {
     cache_read_input_tokens: 0,
   };
 
-  constructor(sessionManager, sessionId, sendToClient, agentConfig, provider = config.agentDefaultProvider) {
+  constructor(sessionManager, sessionId, sendToClient, agentConfig, provider = config.agentDefaultProvider, intelligence = null) {
     this.sessionManager = sessionManager;
     this.sessionId = sessionId;
     this.sendToClient = sendToClient;
     this.stopRequested = false;
     this.provider = provider;
+    // Resolved against this provider's ladder, so it is always a level the provider
+    // actually offers (or null when the provider doesn't participate at all).
+    this.intelligence = resolveLevel(provider, intelligence)?.id ?? null;
+
+    // The engine tools pick their underlyingModel from this. It is a stable OBJECT
+    // that setIntelligence() mutates in place rather than a copied string, because
+    // the tools capture it in a closure at registration time but read it inside the
+    // handler — which is what lets a mid-conversation change reach the next tool
+    // call without re-registering every tool.
+    this.agentProfile = { provider: this.provider, intelligence: this.intelligence };
 
     // SDK-specific properties (for SDK mode)
     this.abortController = null;
@@ -196,7 +254,7 @@ export class AgentOrchestrator {
     this.mediaStore = new MediaStore(sessionManager, sessionId);
 
     // Create tool providers
-    this.builtInToolProvider = new BuiltInToolProvider(sessionManager, sessionId, sendToClient, this.provider, this.mediaStore, this.configManager.canWriteToLocalSandbox());
+    this.builtInToolProvider = new BuiltInToolProvider(sessionManager, sessionId, sendToClient, this.agentProfile, this.mediaStore, this.configManager.canWriteToLocalSandbox());
     this.dynamicToolProvider = new DynamicToolProvider(sessionManager, sessionId, sendToClient, this.mediaStore);
 
     // Provider SDK clients are lazy-instantiated via #getX() — see top-of-file
@@ -384,7 +442,7 @@ export class AgentOrchestrator {
 
     // Build system prompt from config
     const mode = session.mode;
-    const systemPrompt = this.#buildSystemPromptWithRag(mode);
+    const systemPrompt = this.#buildRouteSystemPrompt(mode, 'prefixed');
 
     // Get tool collections
     const builtInTools = this.builtInToolProvider.getTools();
@@ -444,6 +502,19 @@ export class AgentOrchestrator {
 
     const maxIterations = this.configManager.getMaxIterations();
 
+    // Pinned for the whole turn, not re-read per iteration. setIntelligence() can land
+    // between any two awaits below (it arrives as a worker IPC message), and a turn that
+    // swapped models mid tool-use loop would bill half its iterations to one model and
+    // half to another while the client was told nothing changed. Resolving once here is
+    // what makes the documented contract true: the turn finishes on the model it started
+    // with, and the new level applies from the next turn.
+    const model = this.#resolveNativeModel();
+    // Adaptive thinking controls depth via `effort` (output_config) rather than a token
+    // budget — budget_tokens is removed on Opus 4.7+/Sonnet 4.6 and would 400.
+    const thinking = this.#resolveAnthropicThinking();
+    const thinkingEnabled = thinking?.type !== 'disabled';
+    const effort = this.#resolveEffort();
+
     while (true) {
       let continueLoop = true;
       let completedNaturally = false;
@@ -457,12 +528,8 @@ export class AgentOrchestrator {
         await this.sessionManager.cleanupContext(this.sessionId, config.agentMaxContextTokens, this.provider);
 
         try {
-          // Call Claude API. Adaptive thinking controls depth via `effort`
-          // (output_config) rather than a token budget — budget_tokens is removed
-          // on Opus 4.7+/Sonnet 4.6 and would 400.
-          const thinkingEnabled = config.agentAnthropicThinking?.type !== 'disabled';
           const response = await anthropic.messages.create({
-            model: config.nativeAgentProviders.anthropic.model,
+            model,
             max_tokens: 8192,
             system: systemBlocks,
             // Image bytes are attached to a copy here and thrown away with the
@@ -470,12 +537,34 @@ export class AgentOrchestrator {
             // place would put base64 into stored history and into every later
             // token count.
             messages: hydrateMessagesForAnthropic(messages, this.mediaStore),
-            thinking: config.agentAnthropicThinking,
-            ...(thinkingEnabled && { output_config: { effort: config.agentAnthropicEffort } }),
+            thinking,
+            // A level may omit effort on purpose; omit the whole key rather than
+            // sending `{effort: undefined}` so the API applies its own default.
+            ...(thinkingEnabled && effort ? { output_config: { effort } } : {}),
             tools: tools.length > 0 ? tools : undefined
           });
 
-          this.#logApiUsage(Provider.ANTHROPIC, response.usage);
+          // Reported against the pinned model rather than whatever the session resolves
+          // to now, so a level change mid-turn can't misattribute this call's cost.
+          this.#logApiUsage(Provider.ANTHROPIC, response.usage, model);
+
+          // A safety classifier can decline the request: HTTP 200, stop_reason
+          // "refusal", and `content` empty or holding only a partial answer. Checked
+          // before the content is read because the processing path below assumes usable
+          // blocks — without this the turn ends as an opaque stall rather than a reason.
+          // Reachable on any Claude model; the top intelligence rung makes it likelier,
+          // which is why it is handled here rather than left to chance.
+          if (response.stop_reason === 'refusal') {
+            const category = response.stop_details?.category;
+            logger.warn(`Anthropic declined the request (model=${model}${category ? `, category=${category}` : ''})`);
+            await this.sendToClient(createAgentTextMessage(
+              this.sessionId,
+              `I wasn't able to answer that — the safety system for the model I'm using declined the request${category ? ` (${category})` : ''}. Rephrasing it, or switching to a lower intelligence level, will usually get past it.`,
+              false
+            ));
+            continueLoop = false;
+            break;
+          }
 
           // Check if stop was requested during the API call
           if (this.stopRequested) {
@@ -583,7 +672,7 @@ export class AgentOrchestrator {
       content: userMessage
     });
 
-    let systemPrompt = this.#buildSystemPromptWithRag(mode);
+    let systemPrompt = this.#buildRouteSystemPrompt(mode, 'prefixed');
 
     // Check model token count and handle large models (for SDK mode)
     const currentModel = session?.clientModel;
@@ -635,6 +724,7 @@ export class AgentOrchestrator {
         .map(name => `mcp__builtin__${name}`);
       let allowedTools = [
         ...builtInSdkTools,      // SDK filesystem tools (no prefix)
+        ...SDK_WEB_TOOLS,        // web access, every agent — see SDK_WEB_TOOLS
         ...builtInToolNames,     // Built-in tools with mcp__builtin__ prefix
         ...prefixedClientToolNames // Client tools with mcp__client__ prefix
       ];
@@ -647,19 +737,51 @@ export class AgentOrchestrator {
       // would not leave `Read` alone if a builtin were ever named that.
       systemPrompt += this.#anthropicSdkFilesystemToolsNote(builtInSdkTools);
 
+      // Where the SDK's filesystem tools may look, and — via cwd — where a Glob
+      // or Grep that names no path defaults to. Pinning cwd is part of the gate:
+      // bwrap sets no --chdir, so the worker's cwd is the container root and an
+      // unqualified Grep would otherwise walk the whole sandbox.
+      const sessionTempDir = this.sessionManager.getSessionTempDir(this.sessionId);
+      const filesystemRoots = [sessionTempDir, APP_ROOT];
+
+      const anthropicSdkThinking = this.#resolveAnthropicThinking();
+      const anthropicSdkEffort = this.#resolveEffort();
+
       // Build query options with MCP servers
       const queryOptions = {
         abortController: this.abortController,
         systemPrompt: systemPrompt,
-        model: config.nativeAgentProviders.anthropic.model,
+        model: this.#resolveNativeModel(),
         maxTokens: 8192,
         maxTurns: maxIterations,
         mcpServers: mcpServers,
         allowedTools: allowedTools,
         ...(canWriteToLocalSandbox ? {} : { disallowedTools: SDK_WRITE_TOOLS }),
         permissionMode: 'bypassPermissions',
-        thinking: config.agentAnthropicThinking,
-        ...(config.agentAnthropicThinking?.type !== 'disabled' && { effort: config.agentAnthropicEffort }),
+        cwd: sessionTempDir,
+        env: anthropicSdkSubprocessEnv(),
+        // SDK isolation mode. Omitting this loads all three filesystem settings
+        // tiers "matching CLI defaults" (the SDK's own wording): user from
+        // ~/.claude/settings.json, project from <cwd>/.claude/settings.json, local
+        // from <cwd>/.claude/settings.local.json. In the sandbox HOME is /session
+        // and cwd is the session temp dir — the same directory, and the only
+        // writable one — so all three resolve inside space the agent can write,
+        // as does CLAUDE.md. A settings.json dropped there defines `hooks`, which
+        // are shell commands the CLI runs on its own tool calls: that turns any
+        // write primitive into command execution, and turns a written CLAUDE.md
+        // into self-injection. Nothing here needs on-disk settings, so load none.
+        settingSources: [],
+        // Confines native Read/Glob/Grep, which arrive with the claude_code
+        // preset and are handed to every agent including read-only ones. Nothing
+        // else in this options object can do it: allowedTools only pre-approves
+        // a prompt, and bypassPermissions means there is no prompt.
+        hooks: {
+          PreToolUse: [{ hooks: [this.#sdkPreToolUseGuard(filesystemRoots, sessionTempDir)] }],
+        },
+        thinking: anthropicSdkThinking,
+        // Omitted entirely when the level defines no effort — see the manual loop.
+        ...(anthropicSdkThinking?.type !== 'disabled' && anthropicSdkEffort
+          ? { effort: anthropicSdkEffort } : {}),
         compact: true  // Enable automatic compaction
       };
 
@@ -866,6 +988,21 @@ export class AgentOrchestrator {
         await this.#handleAnthropicSdkUserMessage(message);
         break;
 
+      // The SDK reset its transcript and mounted a fresh one — /clear, plan-mode
+      // exit, or a fresh-session flow. None of those are reachable from here (we
+      // send no slash commands and run bypassPermissions), so this is a notice,
+      // not a branch we act on: session_id is what `resume` keys on and it is
+      // unchanged, and nothing we cache is scoped to the conversation id.
+      case 'conversation_reset':
+        break;
+
+      // Liveness heartbeat the SDK emits every 30s while a tool is still running
+      // (our long generate_* tools trip it routinely). Nothing to do: the client
+      // already has the tool-call notification and gets the completion message
+      // when the tool returns.
+      case 'tool_progress':
+        break;
+
       default:
         logger.warn(`Anthropic SDK: Unhandled message type: ${message.type}`, message);
     }
@@ -1066,6 +1203,25 @@ export class AgentOrchestrator {
    * so without this the prohibition is simply absent here — and native `Read` has no
    * guard of its own.
    */
+  /**
+   * The single PreToolUse hook, covering both confinements.
+   *
+   * One function calling two evaluators rather than two entries in the hooks
+   * array: a deny has to win over an allow, and composing them here states that
+   * rather than assuming it of the SDK. Filesystem first — it is synchronous,
+   * while the network check may await a DNS lookup.
+   */
+  #sdkPreToolUseGuard(filesystemRoots, sessionTempDir) {
+    const filesystemGuard = createSdkFilesystemGuard(filesystemRoots, sessionTempDir);
+    const networkGuard = createSdkNetworkGuard();
+
+    return async (input) => {
+      const filesystemDecision = await filesystemGuard(input);
+      if (filesystemDecision?.hookSpecificOutput) return filesystemDecision;
+      return networkGuard(input);
+    };
+  }
+
   #anthropicSdkFilesystemToolsNote(builtInSdkTools) {
     if (!builtInSdkTools?.length) return '';
 
@@ -1089,12 +1245,23 @@ model tools.`;
   /**
    * Prefix tool names in system prompt for SDK mode
    * Scans the system prompt and adds mcp__ prefixes to tool names
+   *
+   * Two tiers, because the two sets of names carry different risk. Built-in names and
+   * the `client_`-prefixed form are ours: they are chosen here, they read as identifiers,
+   * and rewriting them anywhere they appear is safe. A client tool's *bare* name is
+   * chosen by the host application and rewritten only where the prompt marks it up as
+   * code or bold — a client registering `export`, `search` or `notes` would otherwise
+   * have every ordinary occurrence of that word turned into mcp__client__export
+   * mid-sentence. The client-tool roster makes those names appear in the prompt as a
+   * matter of course, so the distinction now earns its keep.
    */
   #anthropicSdkPrefixToolNamesInSystemPrompt(systemPrompt, builtInToolNames, clientToolNames) {
     let modifiedPrompt = systemPrompt;
 
-    // Create mapping of unprefixed tool names to prefixed versions
+    // Rewritten wherever they appear, marked up or not.
     const toolNameMapping = {};
+    // Rewritten only inside `backticks` or **bold**.
+    const delimitedOnlyMapping = {};
 
     // Built-in tools: tool_name -> mcp__builtin__tool_name
     for (const prefixedName of builtInToolNames) {
@@ -1107,27 +1274,35 @@ model tools.`;
       const unprefixedName = clientToolName.replace(/^client_/, '');
       const prefixedName = `mcp__client__${unprefixedName}`;
       toolNameMapping[clientToolName] = prefixedName;
-      // Also map the unprefixed name
-      toolNameMapping[unprefixedName] = prefixedName;
+      // Also map the unprefixed name, for an agent config that writes it plainly —
+      // but only where it is delimited. See the note above.
+      delimitedOnlyMapping[unprefixedName] = prefixedName;
     }
 
     // Replace tool names in the system prompt
     // Look for patterns like `tool_name` or **tool_name** or tool_name (surrounded by word boundaries)
-    for (const [unprefixed, prefixed] of Object.entries(toolNameMapping)) {
-      // Match tool names in backticks, bold, or standalone
-      const patterns = [
-        new RegExp(`\`${unprefixed}\``, 'g'),           // `tool_name`
-        new RegExp(`\\*\\*${unprefixed}\\*\\*`, 'g'),   // **tool_name**
-        new RegExp(`\\b${unprefixed}\\b`, 'g')          // tool_name (word boundary)
-      ];
+    const rewrite = (mapping, includeBareWord) => {
+      for (const [unprefixed, prefixed] of Object.entries(mapping)) {
+        // Escaped: a client picks its own tool names, and a '.' or '(' in one would
+        // otherwise compile into a pattern that matches far more than the name.
+        const escaped = escapeRegExp(unprefixed);
+        const patterns = [
+          new RegExp(`\`${escaped}\``, 'g'),           // `tool_name`
+          new RegExp(`\\*\\*${escaped}\\*\\*`, 'g'),   // **tool_name**
+          ...(includeBareWord ? [new RegExp(`\\b${escaped}\\b`, 'g')] : []) // tool_name
+        ];
 
-      for (const pattern of patterns) {
-        modifiedPrompt = modifiedPrompt.replace(pattern, (match) => {
-          // Preserve the formatting around the tool name
-          return match.replace(unprefixed, prefixed);
-        });
+        for (const pattern of patterns) {
+          modifiedPrompt = modifiedPrompt.replace(pattern, (match) => {
+            // Preserve the formatting around the tool name
+            return match.replace(unprefixed, prefixed);
+          });
+        }
       }
-    }
+    };
+
+    rewrite(toolNameMapping, true);
+    rewrite(delimitedOnlyMapping, false);
 
     return modifiedPrompt;
   }
@@ -1330,35 +1505,59 @@ model tools.`;
    * the shared normalizer below.
    */
   /**
-   * Universal RAG hook: every route builds its system prompt through here so
-   * attached-file context reaches all six provider/loop paths identically.
-   * Appends an "Attached Files" manifest listing each ready file.
+   * Universal system-prompt hook: every route builds its prompt through here, so the
+   * session-dependent sections — the client's own tools, attached-file context — reach
+   * all six provider/loop paths identically instead of once per route.
    *
-   * Wording is intentionally tool-agnostic for the read-in-full (manifest) tier
+   * RAG wording is intentionally tool-agnostic for the read-in-full (manifest) tier
    * ("open and read the file at <path>") — the anthropic-sdk route excludes the
    * read_file built-in (it uses the SDK's native Read) and would rewrite a
    * literal `read_file` token to a non-existent MCP tool. The `search_documents`
    * token is safe to mention (it exists on every route).
+   *
+   * @param {'prefixed'|'bare'} clientToolNameStyle  Passed straight to buildPromptRoster;
+   *        'bare' only on the ADK route, which is the only one that registers client
+   *        tools under their unprefixed names. Explicit at every call site rather than
+   *        re-derived here from provider + agent mode: that derivation is startConversation's
+   *        dispatch, and a second copy of it would drift the moment a route moved.
    */
-  #buildSystemPromptWithRag(mode) {
-    const base = this.configManager.buildSystemPrompt(mode);
+  #buildRouteSystemPrompt(mode, clientToolNameStyle) {
+    const sections = [
+      this.configManager.buildSystemPrompt(mode),
+      // The roster names only tools the route will actually register, which is why the
+      // built-in names go in: under 'bare' they are what a client tool can collide with.
+      this.dynamicToolProvider.buildPromptRoster(clientToolNameStyle, this.#builtInToolNameSet())
+    ];
+
     const files = this.sessionManager.getAttachedFiles(this.sessionId).filter(f => f.status === 'ready');
-    if (files.length === 0) return base;
+    if (files.length > 0) {
+      const tempDir = this.sessionManager.getSessionTempDir(this.sessionId);
+      const lines = files.map(f => {
+        if (f.tier === 'vector') {
+          return `- "${f.name}" (${f.mimeType}, ~${f.tokenCount} tokens) — large document. Use the search_documents tool to find relevant passages (optionally restrict to this file with fileId "${f.fileId}").`;
+        }
+        const path = join(tempDir, 'rag', f.fileId, 'extracted.txt');
+        return `- "${f.name}" (${f.mimeType}, ~${f.tokenCount} tokens) — open and read the file at ${path} to use its full contents.`;
+      });
 
-    const tempDir = this.sessionManager.getSessionTempDir(this.sessionId);
-    const lines = files.map(f => {
-      if (f.tier === 'vector') {
-        return `- "${f.name}" (${f.mimeType}, ~${f.tokenCount} tokens) — large document. Use the search_documents tool to find relevant passages (optionally restrict to this file with fileId "${f.fileId}").`;
-      }
-      const path = join(tempDir, 'rag', f.fileId, 'extracted.txt');
-      return `- "${f.name}" (${f.mimeType}, ~${f.tokenCount} tokens) — open and read the file at ${path} to use its full contents.`;
-    });
-
-    return `${base}
-
-## Attached Files
+      sections.push(`## Attached Files
 The user has attached the following reference documents to this session. Consult them whenever they are relevant to the request.
-${lines.join('\n')}`;
+${lines.join('\n')}`);
+    }
+
+    return sections.filter(Boolean).join('\n\n');
+  }
+
+  /**
+   * Every built-in tool name, unfiltered by availability.
+   *
+   * Used only to settle client-tool name collisions, so it deliberately ignores mode and
+   * model size: whether a client tool exists should not depend on how big the model
+   * happens to be this turn, and a name that is a built-in's in one session is a
+   * built-in's in all of them.
+   */
+  #builtInToolNameSet() {
+    return new Set(this.builtInToolProvider.getToolNames());
   }
 
   async #buildPriorContextTextHelper(history) {
@@ -1640,7 +1839,7 @@ ${lines.join('\n')}`;
 
     const session = this.sessionManager.getSession(this.sessionId);
     const mode = session.mode;
-    const systemPrompt = this.#buildSystemPromptWithRag(mode);
+    const systemPrompt = this.#buildRouteSystemPrompt(mode, 'prefixed');
     const builtInTools = this.builtInToolProvider.getTools();
     const dynamicTools = this.dynamicToolProvider.getTools();
 
@@ -1669,6 +1868,13 @@ ${lines.join('\n')}`;
 
     const maxIterations = this.configManager.getMaxIterations();
 
+    // Pinned for the whole turn — see the anthropic-manual loop for why. It matters more
+    // here: the context cache is created against a specific model, so re-resolving per
+    // iteration would let a mid-turn setIntelligence() rebuild the cache underneath a
+    // running tool-use loop as well as swap the model.
+    const model = this.#resolveNativeModel();
+    const thinkingConfig = this.#resolveGeminiThinking();
+
     while (true) {
       let continueLoop = true;
       let completedNaturally = false;
@@ -1683,18 +1889,19 @@ ${lines.join('\n')}`;
         // Refresh the context cache before each call. #getGeminiManualConfig
         // returns the live cache cheaply while it's valid, and proactively
         // recreates it ~30s before its 300s TTL so it never expires mid-flight.
-        const geminiConfig = await this.#getGeminiManualConfig(systemPrompt, toolDeclarations);
+        const geminiConfig = await this.#getGeminiManualConfig(systemPrompt, toolDeclarations, model, thinkingConfig);
 
         try {
           const response = await gemini.models.generateContent({
-            model: config.nativeAgentProviders.google.model,
+            model,
             // Transient copy — see the anthropic-manual call for why history must
             // never hold the bytes.
             contents: hydrateContentsForGemini(messages, this.mediaStore),
             config: geminiConfig
           });
 
-          this.#logApiUsage(Provider.GOOGLE, response.usageMetadata);
+          // Pinned model, so a level change mid-turn can't misattribute this call.
+          this.#logApiUsage(Provider.GOOGLE, response.usageMetadata, model);
           cacheRetries = 0;
 
           if (this.stopRequested) break;
@@ -1859,7 +2066,9 @@ ${lines.join('\n')}`;
       parts: [{ text: userMessage }]
     });
 
-    let systemPrompt = this.#buildSystemPromptWithRag(mode);
+    // 'bare': getAdkTools strips the client_ prefix before registering, and this route
+    // has no prompt-rewrite pass to reconcile a mismatch the way the SDK route does.
+    let systemPrompt = this.#buildRouteSystemPrompt(mode, 'bare');
     const currentModel = session?.clientModel;
     let modelTokenCount = 0;
 
@@ -1879,13 +2088,16 @@ ${lines.join('\n')}`;
 
     try {
       const builtInAdkTools = await this.builtInToolProvider.getAdkTools(mode, modelTokenCount);
-      const clientAdkTools = await this.dynamicToolProvider.getAdkTools();
+      // The same set the roster was built against a few lines up, so what this
+      // registers and what the prompt announces are decided by one rule, not two.
+      const clientAdkTools = await this.dynamicToolProvider.getAdkTools(this.#builtInToolNameSet());
 
       const pendingCallIds = new Map();
 
+      const geminiThinking = this.#resolveGeminiThinking();
       const agent = new LlmAgent({
         name: this.configManager.getAgentName(),
-        model: config.nativeAgentProviders.google.model,
+        model: this.#resolveNativeModel(),
         // A function, not the string itself. ADK runs any *string* instruction
         // through injectSessionState, which treats every `{IDENTIFIER}` in it as a
         // session-state lookup and throws "Context variable not found" when the key
@@ -1897,7 +2109,8 @@ ${lines.join('\n')}`;
         instruction: () => systemPrompt,
         tools: [...builtInAdkTools, ...clientAdkTools],
         generateContentConfig: {
-          thinkingConfig: config.agentGeminiThinking
+          // Spread so a level that defines no effort sends no thinkingConfig at all.
+          ...(geminiThinking ? { thinkingConfig: geminiThinking } : {})
         },
         // The only way to get a picture in front of the model on this route. ADK
         // drops anything but the returned value from a tool response, so the tools
@@ -2165,9 +2378,18 @@ ${lines.join('\n')}`;
     return declarations;
   }
 
-  async #getGeminiManualConfig(systemPrompt, toolDeclarations) {
+  /**
+   * @param geminiModel   the caller's pinned model for this turn. Passed in rather than
+   *                      re-resolved so every iteration of one turn caches against the
+   *                      same model even if the level changes while the turn is running.
+   * @param geminiThinking the caller's pinned thinkingConfig, or undefined to send none.
+   */
+  async #getGeminiManualConfig(systemPrompt, toolDeclarations, geminiModel, geminiThinking) {
+    // A cache is created against a specific model, so the model belongs in the key.
+    // setIntelligence() also clears the cache explicitly, but keying on the model means
+    // any future path that changes it can't silently reuse a cache built for another.
     // Build a cache key from the stable inputs — recreate if they change (e.g. tool set changes on model resize)
-    const cacheKey = systemPrompt + JSON.stringify(toolDeclarations.map(t => t.name));
+    const cacheKey = geminiModel + systemPrompt + JSON.stringify(toolDeclarations.map(t => t.name));
 
     const cacheStillValid = this.#geminiManualCacheName &&
       this.#geminiManualCacheKey === cacheKey &&
@@ -2176,7 +2398,7 @@ ${lines.join('\n')}`;
     if (cacheStillValid) {
       return {
         cachedContent: this.#geminiManualCacheName,
-        thinkingConfig: config.agentGeminiThinking
+        ...(geminiThinking ? { thinkingConfig: geminiThinking } : {})
       };
     }
 
@@ -2204,7 +2426,7 @@ ${lines.join('\n')}`;
       }
 
       const cache = await gemini.caches.create({
-        model: config.nativeAgentProviders.google.model,
+        model: geminiModel,
         config: cacheConfig
       });
 
@@ -2214,13 +2436,13 @@ ${lines.join('\n')}`;
 
       return {
         cachedContent: cache.name,
-        thinkingConfig: config.agentGeminiThinking
+        ...(geminiThinking ? { thinkingConfig: geminiThinking } : {})
       };
     } catch (e) {
       logger.warn('[gemini-cache] failed to create cache, falling back to uncached:', e.message);
       const cfg = {
         systemInstruction: systemPrompt,
-        thinkingConfig: config.agentGeminiThinking
+        ...(geminiThinking ? { thinkingConfig: geminiThinking } : {})
       };
       if (toolDeclarations.length > 0) {
         cfg.tools = [{ functionDeclarations: toolDeclarations }];
@@ -2275,13 +2497,102 @@ ${lines.join('\n')}`;
   }
 
   /**
-   * Resolve the model id for a native-API provider from the shared registry
-   * config.nativeAgentProviders.
+   * Resolve the model id for a native-API provider.
+   *
+   * The intelligence ladder wins when this provider has one; config.nativeAgentProviders
+   * is the fallback, which is what keeps a provider with no ladder byte-identical to
+   * its pre-feature behaviour without a branch at any call site.
    */
   #resolveNativeModel() {
+    const level = this.#resolveLevelConfig();
+    if (level?.model) return level.model;
+
     const model = config.nativeAgentProviders[this.provider]?.model;
     if (!model) throw new Error(`No nativeAgentProviders entry configured for provider "${this.provider}"`);
     return model;
+  }
+
+  /** The resolved level object for the current (provider, intelligence), or null. */
+  #resolveLevelConfig() {
+    return resolveLevel(this.provider, this.intelligence)?.level ?? null;
+  }
+
+  /**
+   * Anthropic/OpenAI-style effort for the current level.
+   *
+   * Returns undefined when the level deliberately omits `effort` — callers must then
+   * omit the parameter entirely rather than sending `undefined`, so the provider
+   * applies its own default. A missing key and an explicit undefined are not the same
+   * request; on the Anthropic path the latter risks a 400.
+   */
+  #resolveEffort() {
+    const level = this.#resolveLevelConfig();
+    if (level) return level.effort;              // may legitimately be undefined
+    return config.agentAnthropicEffort;           // no ladder -> pre-feature constant
+  }
+
+  /** Anthropic `thinking` config; a level may override the shared default. */
+  #resolveAnthropicThinking() {
+    return this.#resolveLevelConfig()?.thinking ?? config.agentAnthropicThinking;
+  }
+
+  /**
+   * Gemini `thinkingConfig`. Same omit-vs-default contract as #resolveEffort: a level
+   * with no `effort` yields undefined and the caller drops the key.
+   */
+  #resolveGeminiThinking() {
+    const level = this.#resolveLevelConfig();
+    if (!level) return config.agentGeminiThinking; // no ladder -> pre-feature constant
+    return level.effort === undefined ? undefined : { thinkingLevel: level.effort };
+  }
+
+  /**
+   * Change the intelligence level on a live session.
+   *
+   * Deliberately does not tear anything down: conversation history lives in
+   * SessionManager, and both the Anthropic and Gemini routes resolve their model per
+   * turn, so a change simply applies to the next turn. An in-flight turn is left
+   * alone — it finishes on the model it started with.
+   *
+   * The one thing that does need clearing is Gemini's context cache. It is created
+   * against a specific model but keyed only on systemPrompt+tools, so without this
+   * the next call would hand the new model a cache built for the old one.
+   */
+  setIntelligence(requested) {
+    if (!supportsIntelligence(this.provider)) {
+      logger.log(`[intelligence] provider "${this.provider}" does not use intelligence levels — ignoring "${requested}"`);
+      return this.intelligence;
+    }
+
+    const previousModel = this.#resolveNativeModel();
+    const resolved = resolveLevel(this.provider, requested);
+    if (resolved.id === this.intelligence) return this.intelligence;
+
+    this.intelligence = resolved.id;
+    // Mutate in place: the tool providers hold a reference to this object.
+    this.agentProfile.intelligence = resolved.id;
+
+    if (this.#resolveNativeModel() !== previousModel) this.#invalidateGeminiManualCache();
+
+    logger.log(`[intelligence] session ${this.sessionId} -> "${resolved.id}" (${this.#resolveNativeModel()})`);
+    return this.intelligence;
+  }
+
+  /**
+   * Drop the Gemini context cache so the next call rebuilds it against the current
+   * model. Fire-and-forget: the delete is best-effort (Gemini may have expired it
+   * already) and the local handles are what actually gate reuse.
+   */
+  #invalidateGeminiManualCache() {
+    const name = this.#geminiManualCacheName;
+    this.#geminiManualCacheName = null;
+    this.#geminiManualCacheKey = null;
+    this.#geminiManualCacheExpiry = null;
+    if (!name) return;
+
+    this.#getGemini()
+      .then(gemini => gemini.caches.delete({ name }))
+      .catch(() => { /* already expired or unreachable — the cleared handles suffice */ });
   }
 
   /**
@@ -2301,7 +2612,7 @@ ${lines.join('\n')}`;
       content: userMessage
     });
 
-    const systemPrompt = this.#buildSystemPromptWithRag(mode);
+    const systemPrompt = this.#buildRouteSystemPrompt(mode, 'prefixed');
     const currentModel = session?.clientModel;
     let modelTokenCount = 0;
     if (currentModel) {
@@ -2394,16 +2705,21 @@ ${lines.join('\n')}`;
 
         const eventStreamTask = (async () => {
           const seenItemIds = new Set();
+          const countedResponseIds = new Set();
           try {
             for await (const event of result.getFullResponsesStream()) {
-              // Cumulative usage — overwrite each time so the last value
-              // wins. Captured BEFORE the stop check so an in-flight event
-              // carrying usage isn't dropped when the user hits stop: we
-              // still want to flush the latest tally in the finally block.
-              // Reporting happens once when the loop closes or aborts, never
-              // per-event (that would double-count).
+              // One `response.completed` per turn of the tool loop, each carrying
+              // what that turn alone billed — so they are summed into the run's
+              // total, not overwritten. Deduped by response id because the SDK can
+              // reissue an event (see the item dedup below) and a second copy would
+              // bill the same turn twice. Handled BEFORE the stop check so the turn
+              // in flight when the user hits stop is still counted.
               if (event?.type === 'response.completed' && event.response?.usage) {
-                this.#openRouterSdkPendingUsage = event.response.usage;
+                const responseId = event.response.id;
+                if (!responseId || !countedResponseIds.has(responseId)) {
+                  if (responseId) countedResponseIds.add(responseId);
+                  this.#accumulateOpenRouterUsage(event.response.usage);
+                }
                 continue;
               }
 
@@ -2424,7 +2740,13 @@ ${lines.join('\n')}`;
                 continue;
               }
 
-              if (this.stopRequested) break;
+              // After a stop, keep draining the stream rather than abandoning it.
+              // The request already in flight is not cancelled, so its turns finish
+              // and bill regardless; staying on the stream is what lets their
+              // `response.completed` events reach the accumulator above. This costs
+              // no extra waiting — getResponse() below is blocked on the same work
+              // either way. Everything client-facing is skipped from here on.
+              if (this.stopRequested) continue;
 
               // Tool execution completed — emit the completion message.
               if (event?.type === 'tool.call_output') {
@@ -2494,12 +2816,9 @@ ${lines.join('\n')}`;
         // client before we close this iteration.
         await Promise.allSettled([notifyStreamTask, eventStreamTask]);
 
-        // Report the cumulative usage captured from response.completed once
-        // per iteration of the outer queued-message loop.
-        if (this.#openRouterSdkPendingUsage) {
-          this.#logApiUsage(Provider.OPENROUTER, this.#openRouterSdkPendingUsage, model);
-          this.#openRouterSdkPendingUsage = null;
-        }
+        // Report what every turn of this tool loop billed, once per iteration of
+        // the outer queued-message loop.
+        this.#flushOpenRouterUsage(model);
 
         if (this.stopRequested) break;
 
@@ -2539,12 +2858,9 @@ ${lines.join('\n')}`;
         await this.sendToClient(createAgentCompleteMessage(this.sessionId, 'awaiting_user', `Agent error: ${detail}`));
       }
     } finally {
-      // On abort / error paths the in-loop flush above is skipped; report
-      // the latest cumulative usage captured before the break.
-      if (this.#openRouterSdkPendingUsage) {
-        this.#logApiUsage(Provider.OPENROUTER, this.#openRouterSdkPendingUsage, model);
-        this.#openRouterSdkPendingUsage = null;
-      }
+      // A user stop, an abort or an error skips the in-loop flush above, so the
+      // tokens the run spent before it ended are reported here instead.
+      this.#flushOpenRouterUsage(model);
       this.#openRouterSdkFailureDetail = null;
       this.abortController = null;
     }
@@ -2568,7 +2884,7 @@ ${lines.join('\n')}`;
       });
 
       const mode = session.mode;
-      const systemPrompt = this.#buildSystemPromptWithRag(mode);
+      const systemPrompt = this.#buildRouteSystemPrompt(mode, 'prefixed');
       const builtInTools = this.builtInToolProvider.getTools();
       const dynamicTools = this.dynamicToolProvider.getTools();
 
@@ -2624,8 +2940,11 @@ ${lines.join('\n')}`;
               }
             });
 
-            if (completion?.usage)
-              this.#openRouterManualPendingUsage = completion.usage;
+            // Each chat.send bills its own request, so an iteration's usage adds to
+            // the run's total rather than replacing it. Recorded before the stop
+            // check below, so a stop landing between this response and the next
+            // iteration still counts the turn the user was charged for.
+            this.#accumulateOpenRouterUsage(completion?.usage);
 
             if (this.stopRequested) break;
 
@@ -2673,8 +2992,9 @@ ${lines.join('\n')}`;
       await this.sendToClient(createErrorMessage(this.sessionId, `Agent error: ${detail}`, 'AGENT_ERROR'));
       await this.sendToClient(createAgentCompleteMessage(this.sessionId, 'awaiting_user', `Agent error: ${detail}`));
     } finally {
-      if (this.#openRouterManualPendingUsage && llmUsed)
-        this.#logApiUsage(Provider.OPENROUTER, this.#openRouterManualPendingUsage, llmUsed);
+      // One exit for all of them — natural end, user stop, max iterations, a failed
+      // request, a setup error — so however the loop ended, what it spent is reported.
+      if (llmUsed) this.#flushOpenRouterUsage(llmUsed);
     }
   }
 
@@ -2692,13 +3012,11 @@ ${lines.join('\n')}`;
    * so the routes are kept apart rather than bridged by a translation step.
    */
   async startConversationOpenAiCompatibleManual(userMessage) {
-    let llmUsed = null;
     const label = `${this.provider} Manual`;
     try {
       const session = this.sessionManager.getSession(this.sessionId);
       const model = this.#resolveNativeModel();
       const client = await this.#getOpenAiCompatibleClient();
-      llmUsed = model;
 
       this.sessionManager.addToConversationHistory(this.sessionId, {
         role: 'user',
@@ -2706,7 +3024,7 @@ ${lines.join('\n')}`;
       });
 
       const mode = session.mode;
-      const systemPrompt = this.#buildSystemPromptWithRag(mode);
+      const systemPrompt = this.#buildRouteSystemPrompt(mode, 'prefixed');
       const builtInTools = this.builtInToolProvider.getTools();
       const dynamicTools = this.dynamicToolProvider.getTools();
 
@@ -2761,8 +3079,16 @@ ${lines.join('\n')}`;
               ...reasoningParams(this.provider),
             });
 
+            // Reported per request, on the line after it returns, exactly as the
+            // anthropic and gemini manual loops do. Every stop check below is
+            // downstream of this, so no turn the user was billed for can be lost by
+            // ending the loop early. Deferring a summed total to the end would be
+            // wrong twice over: it drops every turn but the last if the run ends
+            // early, and openai's tiers bill by the size of a single prompt — a
+            // summed input count crosses the 272K long-context threshold that no
+            // individual request came near, doubling the rate for the whole run.
             if (completion?.usage)
-              this.#openAiCompatibleManualPendingUsage = completion.usage;
+              this.#logApiUsage(usageProviderFor(this.provider), completion.usage, model);
 
             if (this.stopRequested) break;
 
@@ -2807,9 +3133,6 @@ ${lines.join('\n')}`;
       logger.error(`${label}: in conversation setup: ${detail}`);
       await this.sendToClient(createErrorMessage(this.sessionId, `Agent error: ${detail}`, 'AGENT_ERROR'));
       await this.sendToClient(createAgentCompleteMessage(this.sessionId, 'awaiting_user', `Agent error: ${detail}`));
-    } finally {
-      if (this.#openAiCompatibleManualPendingUsage && llmUsed)
-        this.#logApiUsage(usageProviderFor(this.provider), this.#openAiCompatibleManualPendingUsage, llmUsed);
     }
   }
 
@@ -3276,13 +3599,57 @@ ${lines.join('\n')}`;
     this.#resetAnthropicSdkUsageAccumulator();
   }
 
+  /**
+   * Fold one OpenRouter usage block into the run's running total. Takes either shape
+   * OpenRouter answers with — the responses API's inputTokens/outputTokens/
+   * inputTokensDetails (SDK loop) or chat completions' promptTokens/completionTokens/
+   * promptTokensDetails (manual loop) — and always stores the chat-completions shape,
+   * which TokenUsageReporter reads as-is. `cost` is OpenRouter's authoritative billed
+   * USD for that one request, so it sums like the token counts do; it stays null when
+   * no response carried one, which is how the reporter tells "free" from "unknown".
+   */
+  #accumulateOpenRouterUsage(usage) {
+    if (!usage) return;
+    const details = usage.promptTokensDetails ?? usage.inputTokensDetails;
+    const total = this.#openRouterPendingUsage ?? {
+      promptTokens: 0,
+      completionTokens: 0,
+      promptTokensDetails: { cachedTokens: 0, cacheWriteTokens: 0 },
+      cost: null,
+    };
+    total.promptTokens += usage.promptTokens ?? usage.inputTokens ?? 0;
+    total.completionTokens += usage.completionTokens ?? usage.outputTokens ?? 0;
+    total.promptTokensDetails.cachedTokens += details?.cachedTokens ?? 0;
+    total.promptTokensDetails.cacheWriteTokens += details?.cacheWriteTokens ?? 0;
+    if (typeof usage.cost === 'number') total.cost = (total.cost ?? 0) + usage.cost;
+    this.#openRouterPendingUsage = total;
+  }
+
+  /**
+   * Report the running OpenRouter total and clear it, so a later flush on the same
+   * conversation cannot bill the same tokens a second time.
+   */
+  #flushOpenRouterUsage(model) {
+    if (!this.#openRouterPendingUsage) return;
+    this.#logApiUsage(Provider.OPENROUTER, this.#openRouterPendingUsage, model);
+    this.#openRouterPendingUsage = null;
+  }
+
   #logApiUsage(provider, usage, model = null) {
     if (!usage) return;
-    const resolvedModel = model ?? (
-      provider === Provider.ANTHROPIC
-        ? config.nativeAgentProviders.anthropic.model
-        : config.nativeAgentProviders.google.model
-    );
+    // Falls back to the model this session actually resolved rather than the registry
+    // default, so a raised intelligence level is reflected in the cost report. Guarded
+    // because this is a reporting path: every caller that could hit a provider with no
+    // nativeAgentProviders entry passes `model` explicitly, but a resolver throw here
+    // must never be what loses a turn.
+    let resolvedModel = model;
+    if (!resolvedModel) {
+      try {
+        resolvedModel = this.#resolveNativeModel();
+      } catch {
+        resolvedModel = null;
+      }
+    }
     this.tokenReporter.report({ provider, model: resolvedModel, usage, clientKey: false }).catch(() => {});
   }
 

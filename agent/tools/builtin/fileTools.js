@@ -2,13 +2,17 @@ import { z } from 'zod';
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
 import { dirname } from 'path';
 import { createSuccessResponse, createErrorResponse } from './toolHelpers.js';
+import { APP_ROOT, isWithin } from '../pathConfinement.js';
 
 /**
  * Read/Write/Edit file tools for the non-SDK agent loop.
  * The SDK loop has built-in Read, Edit, Write tools; these mirror them for the manual route.
+ *
+ * The confinement below now lives in pathConfinement.js, shared with the guard
+ * that applies the same rule to the SDK loop's native Read/Glob/Grep.
  */
 
-export function createReadFileTool() {
+export function createReadFileTool(sessionManager, sessionId) {
   return {
     description: `Read a file from disk and return its contents. Use this to load data files (e.g. variable data) into context after a tool has written them to disk. NEVER use this to read model.sdjson — use the read_model_section tool to inspect the model.
 
@@ -29,6 +33,19 @@ Filtering options to avoid reading more than needed:
         if (filePath.endsWith('model.sdjson')) {
           return createErrorResponse('Reading model.sdjson with read_file is not allowed — use the read_model_section tool to inspect the model.');
         }
+
+        // Confine reads to the two directories the agent has legitimate business
+        // in: this session's temp dir (where every tool writes the data files it
+        // tells the model to read) and the application directory. Absent this,
+        // read_file is an arbitrary host-filesystem read whose only boundary is
+        // bwrap — which does not exist on macOS/Windows dev machines, and which
+        // still leaves everything mounted into the sandbox readable. Path is
+        // resolved before comparison, so `..` cannot walk out of a root.
+        const roots = [sessionManager.getSessionTempDir(sessionId), APP_ROOT].filter(Boolean);
+        if (!roots.some(root => isWithin(filePath, root))) {
+          return createErrorResponse(`Reading outside the session directory is not allowed: ${filePath}`);
+        }
+
         if (!existsSync(filePath)) {
           return createErrorResponse(`File not found: ${filePath}`);
         }
@@ -65,7 +82,28 @@ Filtering options to avoid reading more than needed:
   };
 }
 
-export function createWriteFileTool() {
+/**
+ * Where the write tools may put a file: this session's temp directory, and
+ * nothing else.
+ *
+ * Narrower than the read roots on purpose — APP_ROOT is somewhere the agent has
+ * business reading and none writing. bwrap makes /app read-only, but /tmp is a
+ * tmpfs the sandbox can write and the session dir is a bind mount shared with the
+ * host, so "the mounts already constrain this" was only ever half true. Confining
+ * here makes the write half of this file symmetric with the read half rather than
+ * leaving its only boundary somewhere else.
+ */
+function writeRoots(sessionManager, sessionId) {
+  return [sessionManager.getSessionTempDir(sessionId)].filter(Boolean);
+}
+
+function refuseWriteOutsideSession(filePath, sessionManager, sessionId) {
+  const roots = writeRoots(sessionManager, sessionId);
+  if (roots.some(root => isWithin(filePath, root))) return null;
+  return createErrorResponse(`Writing outside the session directory is not allowed: ${filePath}`);
+}
+
+export function createWriteFileTool(sessionManager, sessionId) {
   return {
     description: 'Write content to a file on disk, creating the file (and any parent directories) if it does not exist. Overwrites any existing content. NEVER use this to write to model.sdjson — all model updates must go through the designated model tools.',
     supportedModes: ['sfd', 'cld'],
@@ -76,6 +114,9 @@ export function createWriteFileTool() {
     }),
     handler: async ({ filePath, content }) => {
       try {
+        const refusal = refuseWriteOutsideSession(filePath, sessionManager, sessionId);
+        if (refusal) return refusal;
+
         mkdirSync(dirname(filePath), { recursive: true });
         writeFileSync(filePath, content, 'utf-8');
         return createSuccessResponse({ filePath, bytesWritten: Buffer.byteLength(content, 'utf-8') });
@@ -86,7 +127,7 @@ export function createWriteFileTool() {
   };
 }
 
-export function createEditFileTool() {
+export function createEditFileTool(sessionManager, sessionId) {
   return {
     description: `Replace a string in a file with new content.
 
@@ -103,6 +144,9 @@ NEVER use this to edit model.sdjson — all model updates must go through the de
     }),
     handler: async ({ filePath, oldString, newString, replaceAll = false }) => {
       try {
+        const refusal = refuseWriteOutsideSession(filePath, sessionManager, sessionId);
+        if (refusal) return refusal;
+
         if (!existsSync(filePath)) {
           return createErrorResponse(`File not found: ${filePath}`);
         }
