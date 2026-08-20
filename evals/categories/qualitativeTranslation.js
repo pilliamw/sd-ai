@@ -12,6 +12,7 @@
 
 import pluralize from 'pluralize';
 import utils from '../../utilities/utils.js';
+import { namesEqual } from '../utilities/nameMatching.js';
 import { validateEvaluationResult } from '../evaluationSchema.js';
 
 /**  generic prompt used for all tests */
@@ -260,9 +261,10 @@ export const evaluate = function(generatedResponse, groundTruth) {
         return 0;
     };
 
+    //ground truth names are pluralized, since that is the form they appear in within the english
+    //given to the LLM. a generated name which differs only by pluralization is still the same variable
     const relationshipMatches = function(a, b) {
-        return (a.from.toLowerCase() === b.from.toLowerCase() &&
-            a.to.toLowerCase() === b.to.toLowerCase());
+        return (namesEqual(a.from, b.from) && namesEqual(a.to, b.to));
     };
 
     const cleanedSortedAI = fromAI.map((relationship) => {

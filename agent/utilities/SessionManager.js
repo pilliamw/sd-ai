@@ -15,6 +15,7 @@ const loadOpenRouterSdk = async () => _OpenRouterSdk ??= (await import('@openrou
 let _OpenAiSdk;
 const loadOpenAiSdk = async () => _OpenAiSdk ??= (await import('openai')).OpenAI;
 import { countTokens } from '@anthropic-ai/tokenizer';
+import { measureModelTokens } from '../tools/toolAvailability.js';
 import logger from '../../utilities/logger.js';
 import TokenUsageReporter, { Provider } from '../../utilities/TokenUsageReporter.js';
 import config from '../../config.js';
@@ -71,6 +72,12 @@ export class SessionManager {
 
   constructor(options = {}) {
     this.sessions = new Map();
+
+    // sessionId -> Set of callbacks fired after that session's model changes. Kept
+    // beside the sessions rather than on them because a listener is a fact about who
+    // is watching, not about the session, and it must survive a session record being
+    // rewritten. Cleared with the session in #removeSession.
+    this.modelChangeListeners = new Map();
 
     // Summarization clients for the OpenAI-compatible native providers, keyed by
     // provider id. One SessionManager summarizes for every live session, so a single
@@ -239,6 +246,13 @@ export class SessionManager {
       context: {},
       clientId: null,
 
+      // Who is spending this session's tokens, as the `source` of every usage
+      // report: the normalized name of the agent currently driving the session
+      // (set by AgentOrchestrator, replaced on an agent switch). Null until an
+      // agent is selected — file processing and any other pre-agent work is
+      // reported with no source, the same as a bare engine call.
+      agentName: null,
+
       // Model token tracking
       modelTokenCount: 0,
 
@@ -295,6 +309,7 @@ export class SessionManager {
       clientTools: [],
       context: {},
       clientId: null,
+      agentName: null,
       modelTokenCount: 0,
       pendingToolCalls: new Map(),
       conversationContext: [],
@@ -305,6 +320,25 @@ export class SessionManager {
     this.sessions.set(sessionId, session);
     logger.log(`Session registered: ${sessionId}`);
     return sessionId;
+  }
+
+  /**
+   * Record which agent is driving this session, so every LLM call made on its
+   * behalf — its own turns, its summarization, its tools, and the engines those
+   * tools call — is reported under one name. Called by AgentOrchestrator as it
+   * takes the session over; an agent switch overwrites it.
+   */
+  setAgentName(sessionId, agentName) {
+    const session = this.sessions.get(sessionId);
+    if (!session) {
+      // Every caller builds an orchestrator over a session that already exists, so
+      // there is nothing to recover here — but a missing one would cost the whole
+      // session's usage attribution and change nothing else observable, so say so
+      // rather than letting the reports quietly come back sourceless.
+      logger.warn(`[${sessionId}] setAgentName('${agentName}') found no session — token usage for it will be reported with no source.`);
+      return;
+    }
+    session.agentName = agentName;
   }
 
   /**
@@ -378,30 +412,87 @@ export class SessionManager {
    */
   updateClientModel(sessionId, model) {
     const session = this.getSession(sessionId);
-    if (session) {
-      session.clientModel = model;
-      if (model) {
-        const result = this.#writeModelToDisk(sessionId, model);
-        const parts = [];
-        if (model.errors?.length) {
-          parts.push(`Errors: ${model.errors.map(e => typeof e === 'string' ? e : JSON.stringify(e)).join('; ')}`);
+    if (!session) return;
+
+    session.clientModel = model;
+    // Invalidated, not re-measured. The size decides which editing tools the agent is
+    // offered (see modelStateGate), so a count left over from before this change would
+    // be a stale answer to a live question — but counting here would tokenize the
+    // whole model on every edit, and the routes and gates that actually read the
+    // number ask for it far less often than the model changes. Whoever asks next pays
+    // for it once, via getModelTokenCount or the gate's own cache.
+    session.modelTokenCount = null;
+
+    let outcome;
+    if (model) {
+      const result = this.#writeModelToDisk(sessionId, model);
+      const parts = [];
+      if (model.errors?.length) {
+        parts.push(`Errors: ${model.errors.map(e => typeof e === 'string' ? e : JSON.stringify(e)).join('; ')}`);
+      }
+      // Unit consistency is decided authoritatively by the client's simulation
+      // engine, not by the LLM. When the engine reports an explicit (possibly
+      // empty) unitWarnings array, surface its verdict as a concrete fact so the
+      // agent has no vacuum to fill with fabricated dimensional inconsistencies.
+      // A present-but-empty array is a positive "units are consistent" signal; an
+      // absent field means the client did not report a unit check, so stay silent.
+      if (Array.isArray(model.unitWarnings)) {
+        if (model.unitWarnings.length) {
+          parts.push(`Unit warnings (reported by the simulation engine's unit checker — authoritative): ${model.unitWarnings.map(w => typeof w === 'string' ? w : JSON.stringify(w)).join('; ')}`);
+        } else {
+          parts.push(`Unit check: the simulation engine's unit checker reported NO unit warnings for this model — its units are consistent. Do not report any unit or dimensional-consistency problems.`);
         }
-        // Unit consistency is decided authoritatively by the client's simulation
-        // engine, not by the LLM. When the engine reports an explicit (possibly
-        // empty) unitWarnings array, surface its verdict as a concrete fact so the
-        // agent has no vacuum to fill with fabricated dimensional inconsistencies.
-        // A present-but-empty array is a positive "units are consistent" signal; an
-        // absent field means the client did not report a unit check, so stay silent.
-        if (Array.isArray(model.unitWarnings)) {
-          if (model.unitWarnings.length) {
-            parts.push(`Unit warnings (reported by the simulation engine's unit checker — authoritative): ${model.unitWarnings.map(w => typeof w === 'string' ? w : JSON.stringify(w)).join('; ')}`);
-          } else {
-            parts.push(`Unit check: the simulation engine's unit checker reported NO unit warnings for this model — its units are consistent. Do not report any unit or dimensional-consistency problems.`);
-          }
-        }
-        return { ...result, issues: parts.length ? parts.join('\n') : null };
+      }
+      outcome = { ...result, issues: parts.length ? parts.join('\n') : null };
+    }
+
+    this.#notifyModelChanged(sessionId);
+    return outcome;
+  }
+
+  /**
+   * Run the model-change listeners for a session, isolated from each other and from
+   * the update that triggered them.
+   *
+   * A listener exists to re-derive something from the new model — today, which
+   * editing tools the agent may see. None of that is worth failing a model write for,
+   * and a listener that throws must not take the next one down with it, so each is
+   * called in its own try. Errors are logged rather than swallowed: a tool list that
+   * silently stops tracking the model is the exact failure this mechanism exists to
+   * prevent.
+   */
+  #notifyModelChanged(sessionId) {
+    const listeners = this.modelChangeListeners.get(sessionId);
+    if (!listeners) return;
+
+    for (const listener of listeners) {
+      try {
+        listener();
+      } catch (error) {
+        logger.error(`Model-change listener failed for session ${sessionId}: ${error.message}`);
       }
     }
+  }
+
+  /**
+   * Be told when a session's model changes, whatever changed it — a built-in tool, a
+   * model the client pushed after its own user edited it, or a client tool of the
+   * host application's that the server never sees the inside of.
+   *
+   * That last case is the reason this exists rather than each caller re-checking
+   * after its own edit: when the user's application inserts an assembly, nothing on
+   * the server authored the change, and the only evidence of it is the model arriving
+   * here.
+   *
+   * @returns {() => void} unsubscribe, for a caller that outlives the session
+   */
+  onModelChange(sessionId, listener) {
+    if (!this.modelChangeListeners.has(sessionId)) {
+      this.modelChangeListeners.set(sessionId, new Set());
+    }
+    this.modelChangeListeners.get(sessionId).add(listener);
+
+    return () => this.modelChangeListeners.get(sessionId)?.delete(listener);
   }
 
   /**
@@ -426,8 +517,7 @@ export class SessionManager {
    * Get model token count
    */
   getModelTokenCount(sessionId) {
-    const session = this.getSession(sessionId);
-    return session?.modelTokenCount || 0;
+    return measureModelTokens(this.getSession(sessionId));
   }
 
   /**
@@ -627,6 +717,10 @@ Conversation history:
 ${conversationText}`;
 
       const clientId = this.getSession(sessionId)?.clientId ?? null;
+      // Read here rather than at the start of the switch: on an agent switch the
+      // summary is built for the incoming agent, and by this point it is the one
+      // registered on the session.
+      const source = this.getSession(sessionId)?.agentName ?? null;
       const reporter = new TokenUsageReporter(config.tokenReporterURL, clientId);
 
       let summaryText;
@@ -640,7 +734,7 @@ ${conversationText}`;
           model,
           contents: [{ role: 'user', parts: [{ text: summaryPrompt }] }]
         });
-        reporter.report({ provider: Provider.GOOGLE, model, usage: response.usageMetadata, clientKey: false }).catch(() => {});
+        reporter.report({ provider: Provider.GOOGLE, model, usage: response.usageMetadata, clientKey: false, source }).catch(() => {});
         summaryText = response.text || response.candidates?.[0]?.content?.parts?.[0]?.text || '';
       } else if (isNative) {
         if (!this.openAiCompatibleClients[provider]) {
@@ -654,7 +748,7 @@ ${conversationText}`;
           ...maxOutputTokensParam(provider, 1024),
           ...reasoningParams(provider),
         });
-        reporter.report({ provider: usageProviderFor(provider), model, usage: completion.usage, clientKey: false }).catch(() => {});
+        reporter.report({ provider: usageProviderFor(provider), model, usage: completion.usage, clientKey: false, source }).catch(() => {});
         summaryText = completion.choices?.[0]?.message?.content ?? '';
       } else if (isOpenRouter) {
         if (!this.openRouter) {
@@ -669,7 +763,7 @@ ${conversationText}`;
             maxCompletionTokens: 1024,
           }
         });
-        reporter.report({ provider: Provider.OPENROUTER, model, usage: completion.usage, clientKey: false }).catch(() => {});
+        reporter.report({ provider: Provider.OPENROUTER, model, usage: completion.usage, clientKey: false, source }).catch(() => {});
         const message = completion.choices?.[0]?.message;
         if (typeof message?.content === 'string') {
           summaryText = message.content;
@@ -689,7 +783,7 @@ ${conversationText}`;
           max_tokens: 1024,
           messages: [{ role: 'user', content: summaryPrompt }]
         });
-        reporter.report({ provider: Provider.ANTHROPIC, model, usage: response.usage, clientKey: false }).catch(() => {});
+        reporter.report({ provider: Provider.ANTHROPIC, model, usage: response.usage, clientKey: false, source }).catch(() => {});
         summaryText = response.content[0].text;
       }
 
@@ -878,6 +972,9 @@ ${conversationText}`;
       session.attachedFiles.clear();
 
       this.sessions.delete(sessionId);
+      // Held in a map keyed by session id, so they outlive the session record unless
+      // dropped here — and each one closes over an orchestrator and its tool servers.
+      this.modelChangeListeners.delete(sessionId);
 
       logger.log(`Session deleted: ${sessionId} (remaining: ${this.sessions.size})`);
     }

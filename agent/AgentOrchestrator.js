@@ -56,7 +56,7 @@ import {
   reasoningParams,
   usageProviderFor
 } from './utilities/nativeProviders.js';
-import { isToolAvailable } from './tools/toolAvailability.js';
+import { isToolActive } from './tools/toolAvailability.js';
 import { APP_ROOT, createSdkFilesystemGuard } from './tools/pathConfinement.js';
 import { createSdkNetworkGuard } from './tools/networkConfinement.js';
 import { join } from 'path';
@@ -177,6 +177,10 @@ function toAnthropicMessage(msg) {
  * - Send messages to client via WebSocket
  */
 export class AgentOrchestrator {
+  // Drops this orchestrator's model-change subscription. Held so destroy() can run it
+  // — an agent switch replaces the orchestrator while the session lives on, and a
+  // stale listener would keep syncing a tool server nobody is talking to.
+  #unsubscribeModelChange = null;
   #geminiManualCacheName = null;
   #geminiManualCacheKey = null;
   #geminiManualCacheExpiry = null;
@@ -243,6 +247,15 @@ export class AgentOrchestrator {
     // Load configuration
     this.configManager = new AgentConfigurationManager(agentConfig);
 
+    // Who every token spent from here on is billed to. Published to the session as
+    // well as kept here, because the spenders are scattered: this class's own turns,
+    // the SessionManager's summarizer, the tools, the engines those tools call, and
+    // the RAG embedder all report usage, and all of them can reach the session. Set
+    // before the tool providers are built so nothing can read it half-initialized;
+    // an agent switch builds a new orchestrator and overwrites it.
+    this.agentName = this.configManager.getAgentName();
+    sessionManager.setAgentName(sessionId, this.agentName);
+
     // One media store for the whole worker, injected rather than made per consumer.
     // Four things inside this process need it -- both tool providers, the built-in
     // generate_image and view_media tools, and this class's own hydration of image
@@ -256,6 +269,17 @@ export class AgentOrchestrator {
     // Create tool providers
     this.builtInToolProvider = new BuiltInToolProvider(sessionManager, sessionId, sendToClient, this.agentProfile, this.mediaStore, this.configManager.canWriteToLocalSandbox());
     this.dynamicToolProvider = new DynamicToolProvider(sessionManager, sessionId, sendToClient, this.mediaStore);
+
+    // Keep the SDK route's tool list tracking the model. Subscribed here rather than
+    // at each editing site because the change that matters most is the one no site on
+    // this server makes: the user's application inserting an assembly through a client
+    // tool, which reaches us only as a new model. Every other route rebuilds its
+    // declarations from isToolActive and needs no subscription, so this is a no-op for
+    // them. Released in destroy().
+    this.#unsubscribeModelChange = sessionManager.onModelChange(
+      sessionId,
+      () => this.builtInToolProvider?.syncModelStateGates()
+    );
 
     // Provider SDK clients are lazy-instantiated via #getX() — see top-of-file
     // loaders. A single session uses exactly one provider, so eager
@@ -497,9 +521,6 @@ export class AgentOrchestrator {
       { type: 'text', text: systemPrompt, cache_control: { type: 'ephemeral', ttl: '5m' } }
     ];
 
-    // Convert tool servers to Anthropic tool format (with conditional filtering)
-    const tools = this.#anthropicManualConvertTools(builtInTools, dynamicTools, modelTokenCount, mode);
-
     const maxIterations = this.configManager.getMaxIterations();
 
     // Pinned for the whole turn, not re-read per iteration. setIntelligence() can land
@@ -526,6 +547,12 @@ export class AgentOrchestrator {
 
         // Summarize context in-place if it has grown over the token limit
         await this.sessionManager.cleanupContext(this.sessionId, config.agentMaxContextTokens, this.provider);
+
+        // Rebuilt every iteration, not once per turn: the previous iteration may have
+        // been the tool call that gave this model its first variable, or pushed it
+        // past what the engines can take. Filtering is a pass over a fixed map, so
+        // this costs nothing next to the request it precedes.
+        const tools = this.#anthropicManualConvertTools(builtInTools, dynamicTools, mode);
 
         try {
           const response = await anthropic.messages.create({
@@ -698,7 +725,7 @@ export class AgentOrchestrator {
         : ['Read', 'Glob', 'Grep'];
 
       let mcpServers = {
-        builtin: await this.builtInToolProvider.getMcpServer(mode, modelTokenCount)
+        builtin: await this.builtInToolProvider.getMcpServer(mode)
       };
 
       // Get client MCP server and derive allowed tool names from the same source
@@ -709,9 +736,10 @@ export class AgentOrchestrator {
         mcpServers.client = clientMcpServer;
       }
 
-      // Build allowed tools list with MCP prefixes, filtered by mode, model token
-      // count and client capability — the same predicate getMcpServer registers by,
-      // so this list can never name a tool the server did not register.
+      // Build allowed tools list with MCP prefixes, filtered by mode, sandbox grant
+      // and client capability — the same predicate getMcpServer registers by, so this
+      // list can never name a tool the server did not register. Model-size gating is
+      // not part of either: it happens when the tool is called (modelStateGate).
       const allBuiltInTools = this.builtInToolProvider.getTools();
       const toolSession = this.sessionManager.getSession(this.sessionId);
       const builtInToolNames = this.builtInToolProvider.getToolNames()
@@ -719,7 +747,7 @@ export class AgentOrchestrator {
           if (SDK_FILE_TOOL_TWINS.has(name)) return false; // SDK provides native Read/Write/Edit
           const toolDef = allBuiltInTools.tools[name];
           if (toolDef?.nonSdkOnly) return false;
-          return isToolAvailable(toolDef, { mode, modelTokenCount, session: toolSession, canWriteToLocalSandbox });
+          return isToolActive(toolDef, { mode, session: toolSession, canWriteToLocalSandbox });
         })
         .map(name => `mcp__builtin__${name}`);
       let allowedTools = [
@@ -1770,7 +1798,7 @@ ${lines.join('\n')}`);
   /**
    * Convert tool servers to Anthropic tool format
    */
-  #anthropicManualConvertTools(builtInTools, dynamicTools, modelTokenCount = 0, mode = null) {
+  #anthropicManualConvertTools(builtInTools, dynamicTools, mode) {
     const tools = [];
     const toolNames = new Set();
     const session = this.sessionManager.getSession(this.sessionId);
@@ -1782,8 +1810,8 @@ ${lines.join('\n')}`);
         continue;
       }
 
-      // Skip tools ruled out by mode, model size, or client capability
-      if (!isToolAvailable(toolDef, { mode, modelTokenCount, session, canWriteToLocalSandbox: this.configManager.canWriteToLocalSandbox() })) {
+      // Skip tools ruled out by mode, sandbox grant, or client capability
+      if (!isToolActive(toolDef, { mode, session, canWriteToLocalSandbox: this.configManager.canWriteToLocalSandbox() })) {
         continue;
       }
 
@@ -1864,8 +1892,6 @@ ${lines.join('\n')}`);
       this.sessionManager.updateModelTokenCount(this.sessionId, modelTokenCount);
     }
 
-    const toolDeclarations = this.#geminiManualConvertTools(builtInTools, dynamicTools, modelTokenCount, mode);
-
     const maxIterations = this.configManager.getMaxIterations();
 
     // Pinned for the whole turn — see the anthropic-manual loop for why. It matters more
@@ -1885,6 +1911,13 @@ ${lines.join('\n')}`);
       while (continueLoop && iteration < maxIterations && !this.stopRequested) {
         iteration++;
         await this.sessionManager.cleanupContext(this.sessionId, config.agentMaxContextTokens, this.provider);
+
+        // Rebuilt per iteration so the list tracks the model the previous iteration
+        // may have just changed — see the anthropic-manual loop. The cache below is
+        // keyed on the declared tool names, so a list that changes shape here
+        // correctly invalidates it rather than serving a cache built around a tool
+        // that is no longer offered.
+        const toolDeclarations = this.#geminiManualConvertTools(builtInTools, dynamicTools, mode);
 
         // Refresh the context cache before each call. #getGeminiManualConfig
         // returns the live cache cheaply while it's valid, and proactively
@@ -2087,7 +2120,7 @@ ${lines.join('\n')}`);
     let maxIterationsHit = false;
 
     try {
-      const builtInAdkTools = await this.builtInToolProvider.getAdkTools(mode, modelTokenCount);
+      const builtInAdkTools = await this.builtInToolProvider.getAdkTools(mode);
       // The same set the roster was built against a few lines up, so what this
       // registers and what the prompt announces are decided by one rule, not two.
       const clientAdkTools = await this.dynamicToolProvider.getAdkTools(this.#builtInToolNameSet());
@@ -2346,14 +2379,14 @@ ${lines.join('\n')}`);
     }
   }
 
-  #geminiManualConvertTools(builtInTools, dynamicTools, modelTokenCount = 0, mode = null) {
+  #geminiManualConvertTools(builtInTools, dynamicTools, mode) {
     const declarations = [];
     const toolNames = new Set();
     const session = this.sessionManager.getSession(this.sessionId);
 
     for (const [toolName, toolDef] of Object.entries(builtInTools.tools)) {
       if (toolNames.has(toolName)) continue;
-      if (!isToolAvailable(toolDef, { mode, modelTokenCount, session, canWriteToLocalSandbox: this.configManager.canWriteToLocalSandbox() })) continue;
+      if (!isToolActive(toolDef, { mode, session, canWriteToLocalSandbox: this.configManager.canWriteToLocalSandbox() })) continue;
 
       toolNames.add(toolName);
       declarations.push({
@@ -2626,7 +2659,7 @@ ${lines.join('\n')}`);
     const maxIterations = this.configManager.getMaxIterations();
 
     try {
-      const orTools = await this.#buildOpenRouterTools(mode, modelTokenCount);
+      const orTools = await this.#buildOpenRouterTools(mode);
 
       let userPromptText = userMessage;
       if (previousAgentContext?.length > 0) {
@@ -2914,7 +2947,6 @@ ${lines.join('\n')}`);
         this.sessionManager.updateModelTokenCount(this.sessionId, modelTokenCount);
       }
 
-      const chatTools = this.#openRouterManualConvertTools(builtInTools, dynamicTools, modelTokenCount, mode);
       const maxIterations = this.configManager.getMaxIterations();
 
       while (true) {
@@ -2925,6 +2957,9 @@ ${lines.join('\n')}`);
         while (continueLoop && iteration < maxIterations && !this.stopRequested) {
           iteration++;
           await this.sessionManager.cleanupContext(this.sessionId, config.agentMaxContextTokens, this.provider);
+
+          // Rebuilt per iteration so the list tracks the model — see anthropic-manual.
+          const chatTools = this.#openRouterManualConvertTools(builtInTools, dynamicTools, mode);
 
           try {
             const completion = await openRouterClient.chat.send({
@@ -3054,7 +3089,6 @@ ${lines.join('\n')}`);
         this.sessionManager.updateModelTokenCount(this.sessionId, modelTokenCount);
       }
 
-      const chatTools = this.#openAiManualConvertTools(builtInTools, dynamicTools, modelTokenCount, mode);
       const maxIterations = this.configManager.getMaxIterations();
 
       while (true) {
@@ -3065,6 +3099,9 @@ ${lines.join('\n')}`);
         while (continueLoop && iteration < maxIterations && !this.stopRequested) {
           iteration++;
           await this.sessionManager.cleanupContext(this.sessionId, config.agentMaxContextTokens, this.provider);
+
+          // Rebuilt per iteration so the list tracks the model — see anthropic-manual.
+          const chatTools = this.#openAiManualConvertTools(builtInTools, dynamicTools, mode);
 
           try {
             const completion = await client.chat.completions.create({
@@ -3141,13 +3178,13 @@ ${lines.join('\n')}`);
    * {name, description, parameters}}`, filtered by the same availability rules every
    * route applies.
    */
-  #openAiManualConvertTools(builtInTools, dynamicTools, modelTokenCount, mode) {
+  #openAiManualConvertTools(builtInTools, dynamicTools, mode) {
     const tools = [];
     const seen = new Set();
     const session = this.sessionManager.getSession(this.sessionId);
     for (const [toolName, toolDef] of Object.entries(builtInTools.tools)) {
       if (seen.has(toolName)) continue;
-      if (!isToolAvailable(toolDef, { mode, modelTokenCount, session, canWriteToLocalSandbox: this.configManager.canWriteToLocalSandbox() })) continue;
+      if (!isToolActive(toolDef, { mode, session, canWriteToLocalSandbox: this.configManager.canWriteToLocalSandbox() })) continue;
       seen.add(toolName);
       tools.push({
         type: 'function',
@@ -3371,7 +3408,7 @@ ${lines.join('\n')}`);
    * Wrap built-in and dynamic tools in @openrouter/agent's `tool()` factory so
    * the agent loop auto-executes them.
    */
-  async #buildOpenRouterTools(mode, modelTokenCount) {
+  async #buildOpenRouterTools(mode) {
     const { tool: orTool } = await loadOpenRouterAgent();
     const builtInTools = this.builtInToolProvider.getTools();
     const dynamicTools = this.dynamicToolProvider.getTools();
@@ -3381,7 +3418,7 @@ ${lines.join('\n')}`);
 
     for (const [toolName, toolDef] of Object.entries(builtInTools.tools)) {
       if (seen.has(toolName)) continue;
-      if (!isToolAvailable(toolDef, { mode, modelTokenCount, session, canWriteToLocalSandbox: this.configManager.canWriteToLocalSandbox() })) continue;
+      if (!isToolActive(toolDef, { mode, session, canWriteToLocalSandbox: this.configManager.canWriteToLocalSandbox() })) continue;
       seen.add(toolName);
 
       tools.push(orTool({
@@ -3421,13 +3458,13 @@ ${lines.join('\n')}`);
     return tools;
   }
 
-  #openRouterManualConvertTools(builtInTools, dynamicTools, modelTokenCount, mode) {
+  #openRouterManualConvertTools(builtInTools, dynamicTools, mode) {
     const tools = [];
     const seen = new Set();
     const session = this.sessionManager.getSession(this.sessionId);
     for (const [toolName, toolDef] of Object.entries(builtInTools.tools)) {
       if (seen.has(toolName)) continue;
-      if (!isToolAvailable(toolDef, { mode, modelTokenCount, session, canWriteToLocalSandbox: this.configManager.canWriteToLocalSandbox() })) continue;
+      if (!isToolActive(toolDef, { mode, session, canWriteToLocalSandbox: this.configManager.canWriteToLocalSandbox() })) continue;
       seen.add(toolName);
       tools.push({
         type: 'function',
@@ -3650,7 +3687,7 @@ ${lines.join('\n')}`);
         resolvedModel = null;
       }
     }
-    this.tokenReporter.report({ provider, model: resolvedModel, usage, clientKey: false }).catch(() => {});
+    this.tokenReporter.report({ provider, model: resolvedModel, usage, clientKey: false, source: this.agentName }).catch(() => {});
   }
 
 
@@ -3663,6 +3700,11 @@ ${lines.join('\n')}`);
     if (this.#geminiManualCacheName && this.gemini) {
       this.gemini.caches.delete({ name: this.#geminiManualCacheName }).catch(() => {});
     }
+
+    // Before the provider reference goes: the listener closes over this orchestrator,
+    // and an agent switch destroys one and builds another against the same session.
+    this.#unsubscribeModelChange?.();
+    this.#unsubscribeModelChange = null;
 
     // Clear any references
     this.sessionManager = null;

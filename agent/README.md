@@ -1030,8 +1030,8 @@ When the agent calls a custom tool, the server sends a `tool_call_request` and t
 Automatically, and before its first token. Every provider route puts the client's tools into the
 request's own tool list — name, `description` and `inputSchema` — alongside the built-ins, so there is
 never a discovery step and never a tool the agent has to be told to go looking for. Client tools are
-also the one category that is **never** filtered: `isToolAvailable` gates built-ins by mode, model
-size and media capability, but a registered client tool is advertised unconditionally on every route.
+also the one category that is **never** filtered: `isToolAvailable` gates built-ins by mode, sandbox
+grant and media capability, but a registered client tool is advertised unconditionally on every route.
 
 On top of that, `buildPromptRoster` in [`tools/DynamicToolProvider.js`](tools/DynamicToolProvider.js)
 adds a short **Tools From This Application** section to the system prompt, listing each registered
@@ -1088,16 +1088,54 @@ Each built-in tool is a plain object returned by a factory function. The fields 
 
 | Field | Type | Description |
 |---|---|---|
-| `maxModelTokens` | `number` | If the current model's token count exceeds this value, the tool is excluded from the agent's tool list. Used for tools that receive the full model (e.g., `generate_quantitative_model`). |
-| `minModelTokens` | `number` | If the current model's token count is below this value, the tool is excluded. Used for tools that only make sense for large models (e.g., `read_model_section`, `edit_variables`). |
+| `maxModelTokens` | `number` | Withheld from the agent's tool list while the model's token count exceeds this value, and restored when it drops back. Used for tools that receive the full model (e.g., `generate_quantitative_model`). See *Model-state gates* below. |
+| `requiresModelContent` | `boolean` | Withheld while the model holds no variables, and restored the moment it holds one. Used for tools that edit a model in place (`edit_variables`, `edit_relationships`, `edit_specs`, `edit_modules`) — there must be something there to edit, and one variable is the whole bar. |
 | `requiresMedia` | `'sink' \| 'any'` | Excludes the tool unless the client declared `supportsMedia` at session init **and** its tool list backs that up. `'sink'` needs a client tool with a non-empty `media.inputs` — somewhere a generated picture can go (`generate_image`). `'any'` needs a sink *or* a client tool with `media.returnsMedia` — some way for a handle to exist at all (`view_media`). |
 | `nonSdkOnly` | `boolean` | If `true`, the tool is excluded from the Anthropic SDK (`sdk`) mode's MCP server and the Google ADK tool list. It is only available in `manual` loop mode. Use this for tools that duplicate functionality already provided natively by the SDK (e.g. file system tools). |
 
-All of these are evaluated by one predicate, `isToolAvailable` in [`tools/toolAvailability.js`](tools/toolAvailability.js).
-Every provider route (SDK/MCP, ADK, both manual loops, OpenRouter) filters through it, so a new
-condition added there takes effect everywhere rather than on the routes someone remembered.
+The session-fixed flags — `supportedModes`, `requiresMedia`, `requiresSandboxWrite` — are evaluated by
+one predicate, `isToolAvailable` in [`tools/toolAvailability.js`](tools/toolAvailability.js). Every
+provider route (SDK/MCP, ADK, both manual loops, OpenRouter) filters through it, so a new condition
+added there takes effect everywhere rather than on the routes someone remembered.
 
-Token counting runs on every conversation turn for all sessions. The token thresholds use `agentMaxTokensForEngines` from `config.js` (default: 100,000).
+### Model-state gates
+
+`maxModelTokens` and `requiresModelContent` are decided by a second predicate, `modelStateGate`, and
+a tool they rule out is **withheld** — kept out of the agent's tool list entirely, not offered and
+then refused. `isToolActive` composes the two, and every route's declaration list is built from it.
+
+What makes them a separate predicate is that they are not answered once. A session's mode and grants
+hold for its whole life; the model changes *inside* a turn — a `generate_*` call, a targeted edit, an
+assembly the user's application inserted through a client tool. A tool gated on the model is therefore
+live or dead at a moment, not for a session, and both transitions have to reach the agent as they
+happen. That is a real failure, not a hypothetical one: an agent that watched an assembly land in an
+empty model went on to tell the user it had no way to edit an equation and they would have to go and
+double-click the converters themselves, because `edit_variables` had been filtered out when the turn
+began and nothing put it back.
+
+How the list keeps up depends on what the route can rebuild:
+
+| Route | Mechanism |
+|---|---|
+| Anthropic SDK (`sdk` mode) | The MCP server is built once per query and cannot be re-registered, so a gated tool is **registered and then disabled**. MCP omits a disabled tool from `tools/list` and refuses a call to it, and `BuiltInToolProvider.syncModelStateGates()` toggles it as the model moves — which MCP reports to the client as a `notifications/tools/list_changed`, and the Agent SDK's client re-fetches on it. Registering only the live tools would leave nothing to revive. |
+| Manual loops (Anthropic, Gemini, OpenRouter, OpenAI-compatible) | Declarations are rebuilt **every iteration**, so the list tracks whatever the previous tool call did to the model. Filtering is a pass over a fixed map — it costs nothing next to the request it precedes. |
+| Gemini ADK, OpenRouter agent | Rebuilt per turn. Within a turn the call-time backstop below is what holds. |
+
+The trigger is `SessionManager.onModelChange`, fired from `updateClientModel` — the one funnel every
+model change passes through. The orchestrator subscribes for the SDK route. It has to be a
+subscription rather than a call after each edit, because the change that matters most is the one no
+server-side caller makes: the host application inserting an assembly, which reaches the server only
+as a new model.
+
+Behind all of that, the handler wrapper re-checks the gate when a tool actually runs and returns an
+error envelope naming the tool to use instead. No list is perfectly current at the instant of a call
+— a model can move between the request being built and the call landing — and that backstop is what
+keeps a stale list from producing a bad edit rather than a correctable message.
+
+Model size is measured lazily: `updateClientModel` drops the cached count, and `measureModelTokens`
+re-measures for whoever reads it next. A model changes far more often than the count is read, so
+counting on write tokenized a whole model to answer a question nobody had asked. `maxModelTokens`
+uses `agentMaxTokensForEngines` from `config.js` (default: 32,000).
 
 ---
 
@@ -1129,12 +1167,16 @@ All core tools are registered server-side. Clients do not need to register them.
 ### Feedback
 - **get_feedback_information** — Request feedback loop analysis from client (required before Seldon/LTM tools)
 
-### Large Model Utilities
+### Targeted Editing
+Edits that change one part of a model in place, without sending the whole thing through a generative
+engine. Named for the large models they were built for — where the engines cannot go at all — but
+usable on any model that has something in it (`requiresModelContent`, see *Model-state gates*), which
+is what makes them the way to fix a structure the agent did not author, such as an inserted assembly.
 - **read_model_section** — Read a section of a large model without loading it entirely
-- **edit_variables** — Add, update, or remove variables in a large model in place
-- **edit_relationships** — Add, update, or remove relationships in a large model in place
-- **edit_specs** — Update simulation specs (startTime, stopTime, dt, timeUnits, arrayDimensions) in a large model in place
-- **edit_modules** — Add, update, or remove modules in a large model in place
+- **edit_variables** — Add, update, or remove variables in place, including equations and units
+- **edit_relationships** — Add, update, or remove relationships in place
+- **edit_specs** — Update simulation specs (startTime, stopTime, dt, timeUnits, arrayDimensions) in place
+- **edit_modules** — Add, update, or remove modules in place
 
 ### File Utilities
 - **read_file** — Read a file from the session temp directory (supports line range and search filtering). Used to read manifest-tier attached files in full. (Excluded from the Anthropic SDK route, which uses the SDK's native `Read`.)
