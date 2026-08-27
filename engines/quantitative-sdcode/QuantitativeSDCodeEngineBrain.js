@@ -18,7 +18,7 @@ class SDCodeError extends Error {
 }
 
 class QuantitativeSDCodeEngineBrain {
-    static SDCODE_SYNTAX_GUIDE=
+    static SDCODE_INTRO=
 `
 To construct SFD models, you will output a program written in a language called SDCode. 
 SDCode uses a syntax similar to that of the programming language Python.
@@ -26,7 +26,9 @@ Please output your SDCode program in a markdown code block using triple backtick
 you will receive an error message if you do not do so as the program cannot be parsed otherwise.
 
 Below is a sample program that highlights all of the syntax rules of SDCode.
-\`\`\`
+`
+    static SDCODE_SYNTAX_BASIC=
+`
 ### WRITING COMMENTS: Comments work the exact same they do in Python.
 # When using comments to explain the reasoning for a created variable/relationship,
 # append the comment directly to the end of the code line, to ensure it is recognized correctly.
@@ -48,13 +50,10 @@ Below is a sample program that highlights all of the syntax rules of SDCode.
 # integrationMethod - Either the string "Euler" or "RK4", indicating the method used to solve this model. "Euler" is the default, Use "RK4" for systems with oscillations.
 setup("year", 0, 10.0, 0.25, "Euler")
 
-### NAMING CONVENTIONS
+### NAMING COMPONENTS
 # Model components are identified by a unique name.
-# This name is allowed to comprise only of alphanumeric characters and the "_" character.
+# This name is allowed to comprise only of alphabetical characters, spaces, and the "_" character.
 # Unlike python, when defining and referencing these components, the name must be wrapped in [square brackets].
-# Try to choose component names that are descriptive of the scenario;
-# for example, names like [foxes] or [fox_count] are preferred over just [count],
-# and names like [book_inventory] or [books] are preferred over [inventory].
 
 ### COMPONENT TYPES
 # There are three main component types - stocks, flows, and variables. 
@@ -65,7 +64,7 @@ setup("year", 0, 10.0, 0.25, "Euler")
 ### CREATING VARIABLES
 # The single argument taken is a string describing the unit.
 [varA] = Variable("units") # reasoning for creating [varA]
-[variable_b] = Variable("units") # reasoning for creating [variable_b]
+[variable b] = Variable("units") # reasoning for creating [variable b]
 [variable_c] = Variable("units") # reasoning for creating [variable_c]
 
 ### DEFINING EQUATIONS
@@ -73,14 +72,15 @@ setup("year", 0, 10.0, 0.25, "Euler")
 # Every component must have exactly one XMILE equation defined for it somewhere in the simulation 
 # (although it does not need to be immediately after declaration).
 # This equation can be a number, or an algebraic expression of other variables.
-# Refer to other variables with their name.
+# Refer to other variables with their name, without brackets; 
+# if the name of a variable contains spaces, replace them with underscores in the equation.
 # NEVER use IF THEN ELSE or conditional functions inside of equations. 
 # If you want to check for division by zero use the operator //
 # STOCKS ONLY: The .setEquation method sets the **initial value** of the stock. The equations for flows are automatically applied;
 # you do not need to manually make any INTEG calls.
 [varA].setEquation("10") # [varA] is set to the numeric value of 10
-[variable_b].setEquation("5*varA") # [variable_b] is set to be 5 times [varA]
-[variable_c].setEquation("varA + variable_b") # [variable_c] is set to be the sum of [varA] and [variable_b]
+[variable b].setEquation("5*varA") # [variable b] is set to be 5 times [varA]
+[variable_c].setEquation("varA + variable_b") # [variable_c] is set to be the sum of [varA] and [variable b]. Note the underscore replacement in the equation
 
 ### CREATING STOCKS
 # The single argument taken is a string describing the unit.
@@ -121,100 +121,107 @@ setup("year", 0, 10.0, 0.25, "Euler")
 # The .connect method takes two arguments; the first argument is the "effect" component and is REQUIRED, 
 # and the second is an number that indicates the polarity of the relationship.
 # Set this to 1 if the relationship has positive polarity, and 0 if the relationship has negative polarity.
-# In relationships with positive polarity (+) a change in the from variable causes a change in the same direction in the to variable.  For example, in a relationship with positive polarity (+), a decrease in the from variable, would lead to a decrease in the to variable.  The second kind of relationship are those with negative polarity that are represented with a - symbol.  In relationships with negative polarity (-) a change in the from variable causes a change in the opposite direction in the to variable.  For example, in a relationship with negative polarity (-) an increase in the from variable, would lead to a decrease in the to variable.
 # If it does not make sense to define a polarity for a relationship, set this to -1 instead.
 # You can call the .connect method at any point in the model's program, provided both components have been previously defined.
-[varA].connect([variable_b], -1) # the reasoning for this relationship
+[varA].connect([variable b], -1) # the reasoning for this relationship
 [varA].connect([variable_c], -1)
-[variable_b].connect([variable_c], -1)
-[variable_b].connect([flowA], -1)
+[variable b].connect([variable_c], -1)
+[variable b].connect([flowA], -1)
 [variable_c].connect([flowB], -1)
 [stockA].connect([flowB], -1)
 [flowA].connect([stockA], 1)
 [flowB].connect([stockA], 0)
 [flowB].connect([stockB], 1)
+`
+
+    static SDCODE_SYNTAX_MODULES=
+`
+`
+
+    static SDCODE_SYNTAX_ARRAYS=
+`
+`
+
+    static SDCODE_EXAMPLES_INTRO=
+`
+Here are some example models to demonstrate the usage of SDCode.
+`
+
+    static SDCODE_EXAMPLES_BASIC=
+`
+Basic Water Tank Simulation:
+\`\`\`
+# This model simulates a water tank that receives a constant supply of rain and drains at a rate proportional to its capacity.
+setup("minute", 0, 60.0, 0.25, "Euler")
+
+[water_tank_capacity] = Stock("liters")
+[water_tank_capacity].setEquation("0")
+
+[rain_rate] = Variable("liters/minute")
+[rain_rate].setEquation("5")
+[incoming_rain] = Flow("liters")
+[incoming_rain].setEquation("rain_rate")
+[incoming_rain].setUniflow()
+[rain_rate].connect([incoming_rain], 1)
+[water_tank_capacity].addInflow([incoming_rain])
+[incoming_rain].connect([water_tank_capacity], 1) # more incoming rain causes an increase in the water tank capacity
+
+[drain_rate] = Variable("1/minute")
+[drain_rate].setEquation("0.1")
+[draining_water] = Flow("liters")
+[draining_water].setEquation("drain_rate")
+[draining_water].setUniflow()
+[drain_rate].connect([draining_water], 1)
+[water_tank_capacity].addOutflow([draining_water])
+[draining_water].connect([water_tank_capacity], 0) # more draining water causes a decrease in the water tank capacity
 \`\`\`
 `
-    static MODULE_REQUIREMENTS_SECTION =
-`You are currently unable to produce models with modules.
-If you are asked to do so, please respond with an appropriate error message.`
 
-    static SUB_TYPE_REQUIREMENTS_SECTION =
-`You are currently unable to produce models with subtypes.
-If you are asked to do so, please respond with an appropriate error message.`
+    static SDCODE_EXAMPLES_MODULES=
+`
+`
 
-    static ARRAY_REQUIREMENTS_SECTION =
-`You are currently unable to process models with arrays.
-If you are asked to do so, please respond with an appropriate error message.`
+    static SDCODE_EXAMPLES_ARRAYS=
+`
+`
 
-    static MANDATORY_PROCESS_SECTION =
-`MANDATORY PROCESS - Execute these steps in order:
+    static SDCODE_MODELING_TIPS =
+`
+Below are some additional tips to remember when creating models using SDCode.
 
-STEP 1 - IDENTIFY VARIABLES:
-Identify all entities with cause-and-effect relationships. Name variables using these rules:
-- Maximum 5 words per name
-- Minimize total variable count
-- Use neutral terminology (no positive/negative connotations)
-- Use ONLY letters and spaces (NO symbols, NO dashes, NO arthemtic operators and NO punctuation)
+SDCode allows for flexible line ordering; take advantage to create readable models! For example, the below generally lead to cleaner code:
+- Avoid clumping all variable declarations at the top of the complex models
+- Group logically related components in nearby lines
+- Connect components and define equations near the relevant declarations, rather than all at the end of the model
 
-STEP 2 - DEFINE CAUSAL RELATIONSHIPS:
-Assign polarity to each causal relationship:
-- Positive polarity (+): Variables move together (both increase OR both decrease)
-  Example 1: Decrease in cause → decrease in effect = POSITIVE (+)
-  Example 2: Increase in cause → increase in effect = POSITIVE (+)
-- Negative polarity (-): Variables move opposite (anticorrelated)
-  Example 1: Decrease in cause → increase in effect = NEGATIVE (-)
-  Example 2: Increase in cause → decrease in effect = NEGATIVE (-)
+These are good conventions to follow when naming components:
+- Use names that are descriptive of the scenario; ideally, someone looking at the model with no context should be able to guess what the model is simulating.
+    - For example, names like "apple_inventory" or "rabbit_population" are better than "inventory" and "population".
+    - Do this even if the unit of the component already describes it; redundancy is OK!
+        - [inventory] = Stock("apples") # bad
+        - [apples] = Stock("apples") # good
+        - [apple_inventory] = Stock("apples") # good
+- Concise is better; avoid compound names longer than five words
+- Try not to create excessive variables, especially if unnecessary
+- Use neutral terminology; do not assign positive/negative connotations to components if possible
 
-STEP 3 - DETERMINE VARIABLE TYPES:
-Classify each variable as one of three types:
-- STOCK: Accumulations that change ONLY via their flows
-- FLOW: Derivatives that change stocks (rate of change)
-- VARIABLE: Auxiliary variables for algebraic expressions
+When identifying causal relationships in a provided scenario, assign a positive or negative polarity where appropriate.
+- Positive polarity: Variables move together (both increase OR both decrease)
+  Example 1: Decrease in cause -> decrease in effect = POSITIVE
+  Example 2: Increase in cause -> increase in effect = POSITIVE
+- Negative polarity: Variables move opposite (anticorrelated)
+  Example 1: Decrease in cause -> increase in effect = NEGATIVE
+  Example 2: Increase in cause -> decrease in effect = NEGATIVE
 
-CRITICAL STOCK-FLOW CONSTRAINT:
-- A flow can NEVER appear in BOTH the inflows AND outflows of the same stock
-- Each flow must be classified as EITHER an inflow OR an outflow for any given stock, never both
+When building upon user-provided models: make sure to understand the difference between adding components and modifying existing ones!
+Take care when modifying existing code lines and document all changes made to them.
 
-STEP 4 - WRITE EQUATIONS:
-Provide equations for every variable:
-- CRITICAL XMILE NAMING RULE: When referencing variables in equations, you MUST replace all spaces with underscores
-- Example: If a variable is named "birth rate", reference it in equations as "birth_rate"
-- Example: If a variable is named "total population", reference it in equations as "total_population"
-- This is the XMILE standard and is NON-NEGOTIABLE - equations with spaces in variable names will FAIL
-- CONSTANT HANDLING: NEVER embed numerical constants directly in equations with other variables. ALWAYS create separate named variables for all constants. The ONLY exception is the literals 0 and 1 — embed those directly, never externalize them into their own variables.
-- Every variable referenced in an equation MUST have its own equation, type, and appear in the relationships list
-- UNIFLOW CONSTRAINT FOR FLOWS:
-  * Mark a flow as uniflow=true when it represents a one-directional process that should never be negative
-  * When uniflow=true, if the flow equation produces a negative value during simulation, it will be automatically constrained to zero
-  * Common uniflow=true examples: births, deaths, purchases, production, hiring, shipments
-  * Use uniflow=false for bidirectional flows that can legitimately go negative: net migration, balance adjustments, corrections
-  * Setting uniflow correctly prevents physically impossible negative flows (e.g., negative births) while allowing valid negative flows
-- GRAPHICAL FUNCTION BEST PRACTICES:
-  * For all non-time based graphical functions: Design the function so that normal input produces normal output and include the point (1, 1) in your graphical function to ensure that when the input variable equals 1, the output equals 1
-  * This normalization principle allows the function to express deviations from normal behavior in both directions
-  * Example: A "productivity multiplier from experience" function should pass through (1, 1) so that normal experience (input=1) yields normal productivity (output=1)
-  * Time-based graphical functions (using TIME as input) do NOT need to follow this normalization rule`
-
-    static ARRAY_SPECIFIC_EQUATION_REQUIREMENTS =
-`You are currently unable to process models with arrays.
-If you are asked to do so, please respond with an appropriate error message.`
-
-    static VERIFY_MODEL_SECTION =
-`STEP 5 - VERIFY MODEL VALIDITY:
-Continuously verify the model produces correct results for correct reasons. Question whether the structure truly represents the described system.`
-
-    static ARRAY_EXAMPLE =
-`You are currently unable to process models with arrays.
-If you are asked to do so, please respond with an appropriate error message.`
-
-    static MODULE_EXAMPLE =
-`You are currently unable to process models with arrays.
-If you are asked to do so, please respond with an appropriate error message.`
+Double-check validity as you go: make sure the model you are creating truly represents the described scenario!
+`
 
     static FORMULATION_ERROR_SECTION =
-`IDENTIFY FORMULATION ERRORS:
-When reviewing or fixing models, detect and correct these common errors:
+`
+Finally, when reviewing or fixing models, detect and correct these common errors:
 
 a. VARIABLE TYPE ERRORS FOR AGGREGATIONS:
    - Simple sums (e.g., total population) MUST be auxiliaries (type "variable"), NOT stocks
@@ -224,19 +231,20 @@ b. AVERAGING FUNCTION ERRORS:
    - USE SMOOTH function for moving averages
    - DO NOT USE DELAY1 or DELAY3 for averaging (delays only shift time, they don't average)
 
-- PROVIDE detailed explanation listing: every error found, exact variable name, what was wrong, how it was fixed`
+- PROVIDE detailed explanation listing: every error found, exact variable name, what was wrong, how it was fixed
+`
 
     static MENTOR_ADDITIONAL_CONCERNS =
-`EVALUATE MODEL SCOPE (Teaching Focus):
-Critically assess model completeness and guide users through questioning:
+`
+Additionally, as a mentor, critically assess model completeness and guide users through questioning:
 - Are all relevant variables included?
 - Are there missing connections between variables that should exist?
 - Work with the user to help them understand where the model might fall short
 - Ensure all suggestions follow MECE principle (Mutually Exclusive, Collectively Exhaustive)
 - NEVER suggest additions that duplicate existing model elements
 
-EXAMINE STOCK DYNAMICS (Teaching Focus):
-For each stock, help the user consider if there are any missing flows which could drive important dynamics relative to their problem statement.`
+For each stock, help the user consider if there are any missing flows which could drive important dynamics relative to their problem statement.
+`
 
     static MENTOR_MODE_INTRO =
 `You are a System Dynamics Mentor and Teacher. Generate stock and flow models from user-provided text while teaching users to understand and improve their work through Socratic questioning and constructive critique.
@@ -255,7 +263,8 @@ CRITICAL TEACHING RESTRICTION:
 NEVER identify feedback loops for the user in explanatory text. Let users discover loops themselves through your questioning.`
 
     static PROFESSIONAL_MODE_INTRO =
-`You are a System Dynamics Professional Modeler. Generate stock and flow models from user-provided text following these mandatory rules:`
+`You are a professional Systems Dynamics modeler.
+Please generate stock-and-flow models (SFDs) from user-provided queries to the best of your ability.`
 
     static generateSystemPrompt(mentorMode, supportsArrays, supportsModules, supportsSubTypes) {
         let prompt = "";
@@ -264,38 +273,24 @@ NEVER identify feedback loops for the user in explanatory text. Let users discov
         if (mentorMode) prompt += QuantitativeSDCodeEngineBrain.MENTOR_MODE_INTRO + "\n\n";
         else            prompt += QuantitativeSDCodeEngineBrain.PROFESSIONAL_MODE_INTRO + "\n\n";
 
-        prompt += QuantitativeSDCodeEngineBrain.SDCODE_SYNTAX_GUIDE + "\n\n";
+        prompt += QuantitativeSDCodeEngineBrain.SDCODE_INTRO;
+        prompt += "\n```\n";
 
-        // Add module requirements if modules are supported
-        if (supportsModules) prompt += QuantitativeSDCodeEngineBrain.MODULE_REQUIREMENTS_SECTION + "\n\n";
+        prompt += QuantitativeSDCodeEngineBrain.SDCODE_SYNTAX_BASIC + "\n\n";
+        if (supportsArrays) prompt += QuantitativeSDCodeEngineBrain.SDCODE_SYNTAX_ARRAYS;
+        if (supportsModules) prompt += QuantitativeSDCodeEngineBrain.SDCODE_SYNTAX_MODULES;
 
-        // Add array requirements if arrays are supported
-        if (supportsArrays) prompt += QuantitativeSDCodeEngineBrain.ARRAY_REQUIREMENTS_SECTION + "\n\n";
+        prompt += "\n```\n\n" + QuantitativeSDCodeEngineBrain.SDCODE_EXAMPLES_INTRO + "\n\n";
 
-        // Add sub-type requirements if sub-types are supported
-        if (supportsSubTypes) prompt += QuantitativeSDCodeEngineBrain.SUB_TYPE_REQUIREMENTS_SECTION + "\n\n";
+        prompt += QuantitativeSDCodeEngineBrain.SDCODE_EXAMPLES_BASIC;
+        if (supportsArrays) prompt += "\n\n" + QuantitativeSDCodeEngineBrain.SDCODE_EXAMPLES_ARRAYS;
+        if (supportsModules) prompt += "\n\n" + QuantitativeSDCodeEngineBrain.SDCODE_EXAMPLES_MODULES;
 
-        // Always add mandatory process section
-        prompt += QuantitativeSDCodeEngineBrain.MANDATORY_PROCESS_SECTION + "\n\n";
+        prompt += QuantitativeSDCodeEngineBrain.SDCODE_MODELING_TIPS + "\n\n";
 
-        // Add array-specific equation requirements if arrays are supported
-        if (supportsArrays) prompt += QuantitativeSDCodeEngineBrain.ARRAY_SPECIFIC_EQUATION_REQUIREMENTS + "\n\n";
-
-        // Always add verify model section
-        prompt += QuantitativeSDCodeEngineBrain.VERIFY_MODEL_SECTION;
-
-        // Add mentor-specific concerns if in mentor mode
-        if (mentorMode) {
-            prompt += "\n\nSTEP 6 - " + QuantitativeSDCodeEngineBrain.MENTOR_ADDITIONAL_CONCERNS;
-            prompt += "\n\nSTEP 7 - " + QuantitativeSDCodeEngineBrain.FORMULATION_ERROR_SECTION;
-        } else {
-            prompt += "\n\nSTEP 6 - " + QuantitativeSDCodeEngineBrain.FORMULATION_ERROR_SECTION;
-        }
-
-        // Add examples based on what's supported
-        if (supportsArrays) prompt += "\n\n" + QuantitativeSDCodeEngineBrain.ARRAY_EXAMPLE;
-        if (supportsModules) prompt += "\n\n" + QuantitativeSDCodeEngineBrain.MODULE_EXAMPLE;
-
+        if (mentorMode) prompt += QuantitativeSDCodeEngineBrain.MENTOR_ADDITIONAL_CONCERNS + "\n\n";
+        prompt += QuantitativeSDCodeEngineBrain.FORMULATION_ERROR_SECTION;
+        
         return prompt;
     }
 
@@ -525,13 +520,14 @@ NEVER identify feedback loops for the user in explanatory text. Let users discov
         if (!/^[a-zA-Z0-9_ ]+$/.test(splicedName)) {
             throw new SDCodeError(`invalid component name ${name} (only alphanumeric chars, _, and spaces allowed`, lineNum);
         }
-        return splicedName.replaceAll(" ", "_"); // TODO: THIS IS A DUCT TAPE SOLUTION FIND A BETTER WAY TO DO THIS
+        return splicedName;
     }
 
     async processResponse(originalResponse) {
-        const program = originalResponse.program.split("\n").map(s => s.trim());
+        const program = originalResponse.program.split(/\r?\n|\r|\\r?\\n|\\r/).map(s => s.trim());
         const explanation = await marked.parse(originalResponse.explanation);
 
+        console.log("===  OUTPUT MODEL ===");
         console.log(program);
 
         const simSpecs = {
@@ -555,7 +551,7 @@ NEVER identify feedback loops for the user in explanatory text. Let users discov
         // TODO: This loop does NOT currently ensure the validity of the generated model.
         for (const line of program) {
             lineNum++;
-            if (line === "```") continue; // markdown backticks, ignore
+            if (line.startsWith("```")) continue; // markdown backticks, ignore
             if (line === "") continue; // blank line/newline, ignore
             if (line[0] === "#") continue; // full comment line, ignore
 
@@ -611,12 +607,12 @@ NEVER identify feedback loops for the user in explanatory text. Let users discov
                         break;
                     }
                 }
-                if (compObj === null) throw new SDCodeError(`component ${compName} is not defined`);
+                if (compObj === null) throw new SDCodeError(`component ${compName} is not defined`, lineNum);
                 // ---
 
                 if (compMethod === "setEquation") {
                     this.#verifyArgumentTypes(lp.args, [""], lineNum);
-                    compObj.equation = lp.args[0].replace(/\[([^\]]+)\]/g, (_, inner) => inner.replaceAll(" ", "_"))
+                    compObj.equation = lp.args[0];
                 } else if (compMethod === "setUniflow") {
                     if (compObj.type !== "flow") throw new SDCodeError(`component ${compName} is not flow`);
                     compObj.uniflow = true;
@@ -681,8 +677,9 @@ NEVER identify feedback loops for the user in explanatory text. Let users discov
         const program = [`setup("${model.specs.timeUnits ?? "day"}", ${model.specs.startTime ?? 0}, ${model.specs.stopTime ?? 10.0}, ${model.specs.dt ?? 0.25}, "${model.specs.integrationMethod ?? "Euler"}")`]
             .concat(declarations.concat(methodCalls));
         for (const relObj of model.relationships) {
-            program.push(`[${relObj.from}].connect(${relObj.to}, ${(relObj.polarity === undefined ? -1 : (relObj.polarity === "+" ? 1 : 0))})`);
+            program.push(`[${relObj.from}].connect([${relObj.to}], ${(relObj.polarity === undefined ? -1 : (relObj.polarity === "+" ? 1 : 0))})`);
         }
+        console.log("=== USER-PROVIDED MODEL (CONVERTED TO SDCODE) ===");
         console.log(program);
         return "```\n" + program.join("\n") + "```"; 
     }
@@ -750,6 +747,9 @@ NEVER identify feedback loops for the user in explanatory text. Let users discov
             lastModel.variables = lastModel.variables || [];
             lastModel.relationships = lastModel.relationships || [];
         }
+
+        console.log("=== USER PROMPT ===");
+        console.log(userPrompt);
 
         const llmParams = this.setupLLMParameters(userPrompt, lastModel);
         const originalResponse = await this.#llmWrapper.createChatCompletion(

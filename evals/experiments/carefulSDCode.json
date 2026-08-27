@@ -11,13 +11,23 @@
                 "tokensPerMinute": 90000,
                 "requestsPerMinute": 10
             }
+        },
+        "quantitative-gemini-3.6-flash": {
+            "engine": "quantitative",
+            "additionalParameters": {
+                "underlyingModel": "gemini-3.6-flash"
+            },
+            "limits": {
+                "tokensPerMinute": 90000,
+                "requestsPerMinute": 10
+            }
         }
     },
     "categories": {
         "quantitativeIteration": true,
         "quantitativeTranslation": true,
         "quantitativeCausalReasoning": true,
-        "quantitativeErrorFixing": true,
+        "quantitativeErrorFixing": false,
         "conformance": true
     }
 }
