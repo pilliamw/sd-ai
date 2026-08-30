@@ -27,7 +27,10 @@
         "quantitativeIteration": true,
         "quantitativeTranslation": true,
         "quantitativeCausalReasoning": true,
-        "quantitativeErrorFixing": false,
-        "conformance": true
+        "quantitativeErrorFixing": true,
+        "conformance": true,
+        "quantitativeModularModification": true,
+        "quantitativeModularReasoning": true,
+        "quantitativeModularTranslation": true
     }
 }

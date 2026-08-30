@@ -136,6 +136,45 @@ setup("year", 0, 10.0, 0.25, "Euler")
 
     static SDCODE_SYNTAX_MODULES=
 `
+### MODULES
+# You can group related components in a model into a module.
+# Modules have the same naming rules as other components. The constructor takes no arguments.
+[module A] = Module()
+[module B] = Module()
+
+# To create a component inside a module, use the following syntax:
+[module A.population] = Stock("units")
+[module A.population].setEquation("1000")
+[module A.birth rate] = Variable("unitless")
+[module A.birth rate].setEquation("0.1")
+[module B.population] = Stock("units")
+[module B.population].setEquation("500")
+
+# You can also create submodules as so:
+[module A.module C] = Module()
+[module A.module C.placeholder] = Stock("units")
+
+# Note the usage of a period in the component name; these ALWAYS indicate modular components and are not permitted otherwise.
+# If the module has not been defined previously in the program, you will get an error.
+# Additionally, note that variable names only have to be unique within their respective module.
+# Consider the base model (with no module prefix) to be its own "module" for scope purposes (i.e. naming).
+
+# Components in a module can only be connected to other components in the same module.
+# To reference components in other modules, create a "ghost" component to access its value.
+# Ghost components are effectively read-only.
+[module A.B population] = Ghost([module B.population]) # constructor takes a single argument - the referenced component
+
+[module A.births] = Flow("units")
+
+# To reference modular components in equations, use the following syntax:
+[module A.births].setEquation("(population + B_population) * birth_rate")
+# Key takeaway: because names are unique within a module, and components in a module are scoped,
+# it is not necessary to specify the parent module name in the equation. This is why the ghost component is necessary.
+
+# Connect the flow to the stock in module A
+[module A.births].setUniflow()
+[module A.population].addInflow([module A.births])
+[module A.population].connect([module A.births], 1)
 `
 
     static SDCODE_SYNTAX_ARRAYS=
@@ -179,6 +218,51 @@ setup("minute", 0, 60.0, 0.25, "Euler")
 
     static SDCODE_EXAMPLES_MODULES=
 `
+Modular Fox-Rabbit Ecosystem Simulation:
+\`\`\`
+# This model uses modules to simulate two animal populations (foxes and hares) in a basic ecosystem.
+setup("day", 0, 365.0, 1.0, "Euler")
+
+[foxes] = Module()
+[foxes.population] = Stock("foxes")
+[foxes.population].setEquation("100")
+
+[hares] = Module()
+[hares.population] = Stock("hares")
+[hares.population].setEquation("1000")
+
+# hare reproduction
+[hares.birth rate] = Variable("unitless")
+[hares.birth rate].setEquation("0.05")
+[hares.births] = Flow("hares")
+[hares.births].setEquation("population * birth_rate")
+[hares.births].setUniflow()
+[hares.population].addInflow([hares.births])
+[hares.population].connect([hares.births], 1) # more hares = more births from reproduction
+[hares.births].connect([hares.population], 1) # more hare births = more hares
+
+# fox reproduction
+[foxes.birth rate] = Variable("unitless")
+[foxes.birth rate].setEquation("0.01")
+[foxes.births] = Flow("foxes")
+[foxes.births].setEquation("population * birth_rate")
+[foxes.births].setUniflow()
+[foxes.population].addInflow([foxes.births])
+[foxes.population].connect([foxes.births], 1) # more foxes = more births from reproduction
+[foxes.births].connect([foxes.population], 1) # more fox births = more foxes
+
+# fox predation
+[foxes.consumption] = Variable("hares/fox")
+[foxes.consumption].setEquation("2")
+[hares.fox population] = Ghost([foxes.population])
+[hares.fox consumption] = Ghost([foxes.consumption])
+[hares.deaths] = Flow("hares")
+[hares.deaths].setEquation("fox_population * fox_consumption")
+[hares.deaths].setUniflow()
+[hares.population].addOutflow([hares.deaths])
+[hares.fox population].connect([hares.deaths], 1) # more foxes = more hare deaths from predation
+[hares.deaths].connect([hares.population], 0) # more deaths = less hares
+\`\`\`
 `
 
     static SDCODE_EXAMPLES_ARRAYS=
@@ -517,8 +601,8 @@ Please generate stock-and-flow models (SFDs) from user-provided queries to the b
             throw new SDCodeError(`invalid component name ${name} (should be contained in [square brackets])`, lineNum);
         }
         const splicedName = name.slice(1, name.length-1);
-        if (!/^[a-zA-Z0-9_ ]+$/.test(splicedName)) {
-            throw new SDCodeError(`invalid component name ${name} (only alphanumeric chars, _, and spaces allowed`, lineNum);
+        if (!/^[a-zA-Z0-9_ .]+$/.test(splicedName)) {
+            throw new SDCodeError(`invalid component name ${name} (only alphanumeric chars, _, periods, and spaces allowed`, lineNum);
         }
         return splicedName;
     }
@@ -576,26 +660,49 @@ Please generate stock-and-flow models (SFDs) from user-provided queries to the b
                 const eqIndex = lp.method.indexOf("=")
                 const compName = this.#cleanComponentName(lp.method.slice(0, eqIndex).trim(), lineNum);
                 const compType = lp.method.slice(eqIndex+1).trim();
-                this.#verifyArgumentTypes(lp.args, [""], lineNum);
-                if (compType !== "Stock" && compType !== "Flow" && compType !== "Variable") {
+                
+                if (compType === "Module") {
+                    // no arguments
+                } else if (compType !== "Stock" && compType !== "Flow" && compType !== "Variable" && compType !== "Ghost") {
                     throw new SDCodeError(`unrecognized component type ${compType}`, lineNum);
+                } else {
+                    this.#verifyArgumentTypes(lp.args, [""], lineNum);
                 }
-                // TODO: VERIFY NAME IS NOT ALREADY TAKEN
-                mdl.variables.push({
-                    name: compName,
-                    equation: null, // TODO: ENFORCE THAT THIS IS SET LATER
-                    type: compType.toLowerCase(),
-                    documentation: lp.comment,
-                    units: lp.args[0],
-                    ...(compType.toLowerCase() === "stock" && 
-                        { inflows: [], outflows: [] }
-                    ),
-                    ...(compType.toLowerCase() === "flow" &&
-                        { uniflow: false } // default false, set to true later if .setUniflow() is called
-                    )
-                });
-            } else if (lp.method.indexOf(".") !== -1) {
-                const pdIndex = lp.method.indexOf(".");
+
+                if (compType.toLowerCase() === "module") {
+                    // TODO: VERIFY NAME IS NOT DUPLICATE IS VALID ETC ETC
+                    mdl.modules.push(compName);
+                } else {
+                    // TODO: VERIFY NAME IS NOT ALREADY TAKEN
+                    mdl.variables.push({
+                        name: compName,
+                        documentation: lp.comment,
+                        ...(compType.toLowerCase() !== "ghost" &&
+                            { 
+                                units: lp.args[0], 
+                                type: compType.toLowerCase(), 
+                                equation: null // TODO: ENFORCE THAT THIS IS SET LATER
+                            }
+                        ),
+                        ...(compType.toLowerCase() === "stock" && 
+                            { inflows: [], outflows: [] }
+                        ),
+                        ...(compType.toLowerCase() === "flow" &&
+                            { uniflow: false } // default false, set to true later if .setUniflow() is called
+                        ),
+                        ...(compType.toLowerCase() === "ghost" &&
+                            { 
+                                // TODO: VERIFY CROSS LEVEL GHOST ELEMENT IS DEFINED
+                                crossLevelGhostOf: this.#cleanComponentName(lp.args[0], lineNum), 
+                                type: "variable",
+                                equation: ""
+                            } 
+                            
+                        )
+                    });
+                }
+            } else if (lp.method.lastIndexOf(".") !== -1) {
+                const pdIndex = lp.method.lastIndexOf(".");
                 const compName = this.#cleanComponentName(lp.method.slice(0, pdIndex).trim(), lineNum);
                 const compMethod = lp.method.slice(pdIndex+1).trim();
                 
@@ -631,6 +738,8 @@ Please generate stock-and-flow models (SFDs) from user-provided queries to the b
                         ...(lp.args[1] !== -1 && { polarity: lp.args[1] === 1 ? "+" : "-" }),
                         reasoning: lp.comment
                     })
+                } else {
+                    throw new SDCodeError(`couldn't recognize this method call ${lp.method}`, lineNum);
                 }
             } else {
                 throw new SDCodeError(`couldn't recognize this method call ${lp.method}`, lineNum);
@@ -651,11 +760,23 @@ Please generate stock-and-flow models (SFDs) from user-provided queries to the b
     }
 
     #convertToSDCode(model) {
+        const moduleDeclarations = [];
         const declarations = [];
+        const ghostDeclarations = [];
         const methodCalls = [];
         // TODO: ARRANGE IN LOGICAL MANNER
+        if (Array.isArray(model.modules)) {
+            for (const module of model.modules) {
+                moduleDeclarations.push(`[${module.name}] = new Module()`); // TODO: FIX THIS WITH NESTED MODULES
+            }
+        }
         for (const varObj of model.variables) {
-            declarations.push(`[${varObj.name}] = ${varObj.type[0].toUpperCase() + varObj.type.slice(1)}("${varObj.units ?? "units"}")`);
+            if (varObj.crossLevelGhostOf != null && varObj.crossLevelGhostOf.trim() !== "") {
+                ghostDeclarations.push(`[${varObj.name}] = Ghost([${varObj.crossLevelGhostOf.trim()}])`)
+            } else {
+                 declarations.push(`[${varObj.name}] = ${varObj.type[0].toUpperCase() + varObj.type.slice(1)}("${varObj.units ?? "units"}")`);
+            }
+           
             methodCalls.push(`[${varObj.name}].setEquation("${varObj.equation}")`);
             if (varObj.type === "flow" && varObj.uniflow) {
                 methodCalls.push(`[${varObj.name}].setUniflow()`);
@@ -675,7 +796,7 @@ Please generate stock-and-flow models (SFDs) from user-provided queries to the b
         }
         // long one-liner; apologies
         const program = [`setup("${model.specs.timeUnits ?? "day"}", ${model.specs.startTime ?? 0}, ${model.specs.stopTime ?? 10.0}, ${model.specs.dt ?? 0.25}, "${model.specs.integrationMethod ?? "Euler"}")`]
-            .concat(declarations.concat(methodCalls));
+            .concat(moduleDeclarations.concat(declarations.concat(ghostDeclarations.concat(methodCalls))));
         for (const relObj of model.relationships) {
             program.push(`[${relObj.from}].connect([${relObj.to}], ${(relObj.polarity === undefined ? -1 : (relObj.polarity === "+" ? 1 : 0))})`);
         }
