@@ -30,9 +30,10 @@ Below is a sample program that highlights all of the syntax rules of SDCode.
     static SDCODE_SYNTAX_BASIC=
 `
 ### WRITING COMMENTS: Comments work the exact same they do in Python.
-# When using comments to explain the reasoning for a created variable/relationship,
+# IMPORTANT: When using comments to explain the reasoning for a created variable/relationship,
 # append the comment directly to the end of the code line, to ensure it is recognized correctly.
-# Comments never directly affect how a simulation runs.
+# Comments never directly affect how a simulation runs. However, please add a comment after every
+# declaration of a component in order to document the reason behind its creation.
 
 ### STRINGS
 # Strings should always be delimited by double quotation marks "like this".
@@ -152,7 +153,7 @@ setup("year", 0, 10.0, 0.25, "Euler")
 
 # You can also create submodules as so:
 [module A.module C] = Module()
-[module A.module C.placeholder] = Stock("units")
+[module C.placeholder] = Stock("units") # Note: NOT module A.module C.placeholder
 
 # Note the usage of a period in the component name; these ALWAYS indicate modular components and are not permitted otherwise.
 # If the module has not been defined previously in the program, you will get an error.
@@ -305,17 +306,16 @@ Double-check validity as you go: make sure the model you are creating truly repr
 
     static FORMULATION_ERROR_SECTION =
 `
-Finally, when reviewing or fixing models, detect and correct these common errors:
+Finally, note that models given to you by the user may not be perfect or error-free. If you think that
+there are errors in the model given to you by the user, please detect and correct them, and clearly indicate that you have done so.
 
-a. VARIABLE TYPE ERRORS FOR AGGREGATIONS:
-   - Simple sums (e.g., total population) MUST be auxiliaries (type "variable"), NOT stocks
-   - Stocks represent accumulations via flows; sums are algebraic calculations
-
-b. AVERAGING FUNCTION ERRORS:
-   - USE SMOOTH function for moving averages
-   - DO NOT USE DELAY1 or DELAY3 for averaging (delays only shift time, they don't average)
-
-- PROVIDE detailed explanation listing: every error found, exact variable name, what was wrong, how it was fixed
+In particular, watch out for these common errors in SFD models:
+- Component Type Errors:
+   - Simple sums that do not accumulate (i.e. total population calculated by adding two stocks) MUST be variables, NOT stocks
+   - Remember, stocks represent accumulations via flows, while sums are algebraic calculations
+- Averaging Function Errors:
+   - Use the SMOOTH function for moving averages
+   - Do not use DELAY1 or DELAY3 for averaging (delays only shift time, they don't average)
 `
 
     static MENTOR_ADDITIONAL_CONCERNS =
@@ -774,7 +774,7 @@ Please generate stock-and-flow models (SFDs) from user-provided queries to the b
             if (varObj.crossLevelGhostOf != null && varObj.crossLevelGhostOf.trim() !== "") {
                 ghostDeclarations.push(`[${varObj.name}] = Ghost([${varObj.crossLevelGhostOf.trim()}])`)
             } else {
-                 declarations.push(`[${varObj.name}] = ${varObj.type[0].toUpperCase() + varObj.type.slice(1)}("${varObj.units ?? "units"}")`);
+                 declarations.push(`[${varObj.name}] = ${varObj.type[0].toUpperCase() + varObj.type.slice(1)}("${varObj.units ?? "units"}") # ${varObj.documentation}`);
             }
            
             methodCalls.push(`[${varObj.name}].setEquation("${varObj.equation}")`);
