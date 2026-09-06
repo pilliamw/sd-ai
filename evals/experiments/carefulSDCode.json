@@ -25,12 +25,13 @@
     },
     "categories": {
         "quantitativeIteration": true,
-        "quantitativeTranslation": true,
-        "quantitativeCausalReasoning": true,
+        "quantitativeTranslation": false,
+        "quantitativeCausalReasoning": false,
         "quantitativeErrorFixing": true,
-        "conformance": true,
+        "conformance": false,
         "quantitativeModularModification": true,
         "quantitativeModularReasoning": true,
-        "quantitativeModularTranslation": true
+        "quantitativeModularTranslation": true,
+        "variableDocumentation": true
     }
 }

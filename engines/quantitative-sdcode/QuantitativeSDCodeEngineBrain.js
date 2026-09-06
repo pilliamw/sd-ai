@@ -30,10 +30,9 @@ Below is a sample program that highlights all of the syntax rules of SDCode.
     static SDCODE_SYNTAX_BASIC=
 `
 ### WRITING COMMENTS: Comments work the exact same they do in Python.
-# IMPORTANT: When using comments to explain the reasoning for a created variable/relationship,
-# append the comment directly to the end of the code line, to ensure it is recognized correctly.
-# Comments never directly affect how a simulation runs. However, please add a comment after every
-# declaration of a component in order to document the reason behind its creation.
+# IMPORTANT: When using comments to explain the reasoning for a created variable/relationship, append the comment directly to the end of the code line, to ensure it is recognized correctly.
+# Comments never directly affect how a simulation runs. However, please add a comment after every declaration of a component in order to document the reason behind its creation.
+# Make sure to explain what role the component serves in a simulation; do not merely repeat that the component is being created.
 
 ### STRINGS
 # Strings should always be delimited by double quotation marks "like this".
@@ -70,15 +69,12 @@ setup("year", 0, 10.0, 0.25, "Euler")
 
 ### DEFINING EQUATIONS
 # Set the XMILE equation for a component with the .setEquation method. This takes one argument, the XMILE equation as a string.
-# Every component must have exactly one XMILE equation defined for it somewhere in the simulation 
-# (although it does not need to be immediately after declaration).
+# Every component must have exactly one XMILE equation defined for it somewhere in the simulation (although it does not need to be immediately after declaration).
 # This equation can be a number, or an algebraic expression of other variables.
-# Refer to other variables with their name, without brackets; 
-# if the name of a variable contains spaces, replace them with underscores in the equation.
+# Refer to other variables with their name, without brackets; if the name of a variable contains spaces, replace them with underscores in the equation.
 # NEVER use IF THEN ELSE or conditional functions inside of equations. 
 # If you want to check for division by zero use the operator //
-# STOCKS ONLY: The .setEquation method sets the **initial value** of the stock. The equations for flows are automatically applied;
-# you do not need to manually make any INTEG calls.
+# STOCKS ONLY: The .setEquation method sets the **initial value** of the stock. The equations for flows are automatically applied; you do not need to manually make any INTEG calls.
 [varA].setEquation("10") # [varA] is set to the numeric value of 10
 [variable b].setEquation("5*varA") # [variable b] is set to be 5 times [varA]
 [variable_c].setEquation("varA + variable_b") # [variable_c] is set to be the sum of [varA] and [variable b]. Note the underscore replacement in the equation
@@ -101,8 +97,7 @@ setup("year", 0, 10.0, 0.25, "Euler")
 # By default, all flows are bi-directional.
 # Use the .setUniflow method on flows to prevent them from going negative.
 # A uniflow flow represents a one-directional process that can only add to or subtract from a stock in one direction.
-# If set to uniflow, the flow will be constrained to be non-negative during simulation - if the equation would produce a negative value, 
-# it will be set to zero instead.
+# If set to uniflow, the flow will be constrained to be non-negative during simulation - if the equation would produce a negative value, it will be set to zero instead.
 # Common examples of uniflow flows: births, deaths, purchases, production. 
 # Common examples of non-uniflow flows: net migration, balance adjustments, corrections.
 [flowA].setUniflow()
@@ -119,17 +114,15 @@ setup("year", 0, 10.0, 0.25, "Euler")
 # You should specify "cause-effect" relationships between every pair of components in the model.
 # To do so, use the .connect method, which is available on all components.
 # Call the .connect method on the "causal" component.
-# The .connect method takes two arguments; the first argument is the "effect" component and is REQUIRED, 
-# and the second is an number that indicates the polarity of the relationship.
+# The .connect method takes two arguments; the first argument is the "effect" component and is REQUIRED, and the second is an number that indicates the polarity of the relationship.
 # Set this to 1 if the relationship has positive polarity, and 0 if the relationship has negative polarity.
-# If it does not make sense to define a polarity for a relationship, set this to -1 instead.
 # You can call the .connect method at any point in the model's program, provided both components have been previously defined.
-[varA].connect([variable b], -1) # the reasoning for this relationship
-[varA].connect([variable_c], -1)
-[variable b].connect([variable_c], -1)
-[variable b].connect([flowA], -1)
-[variable_c].connect([flowB], -1)
-[stockA].connect([flowB], -1)
+[varA].connect([variable b], 1) # the reasoning for this relationship
+[varA].connect([variable_c], 1)
+[variable b].connect([variable_c], 1)
+[variable b].connect([flowA], 1)
+[variable_c].connect([flowB], 1)
+[stockA].connect([flowB], 1)
 [flowA].connect([stockA], 1)
 [flowB].connect([stockA], 0)
 [flowB].connect([stockB], 1)
@@ -184,7 +177,7 @@ setup("year", 0, 10.0, 0.25, "Euler")
 
     static SDCODE_EXAMPLES_INTRO=
 `
-Here are some example models to demonstrate the usage of SDCode.
+Here are some example models to demonstrate the usage of SDCode. These models contain minimal commenting for brevity; when generating a real model, please comment all components declarations and .connect()s appropriately.
 `
 
     static SDCODE_EXAMPLES_BASIC=
@@ -194,26 +187,26 @@ Basic Water Tank Simulation:
 # This model simulates a water tank that receives a constant supply of rain and drains at a rate proportional to its capacity.
 setup("minute", 0, 60.0, 0.25, "Euler")
 
-[water_tank_capacity] = Stock("liters")
-[water_tank_capacity].setEquation("0")
+[water tank capacity] = Stock("liters")
+[water tank capacity].setEquation("0")
 
-[rain_rate] = Variable("liters/minute")
-[rain_rate].setEquation("5")
-[incoming_rain] = Flow("liters")
-[incoming_rain].setEquation("rain_rate")
-[incoming_rain].setUniflow()
-[rain_rate].connect([incoming_rain], 1)
-[water_tank_capacity].addInflow([incoming_rain])
-[incoming_rain].connect([water_tank_capacity], 1) # more incoming rain causes an increase in the water tank capacity
+[rain rate] = Variable("liters/minute")
+[rain rate].setEquation("5")
+[incoming rain] = Flow("liters")
+[incoming rain].setEquation("rain_rate")
+[incoming rain].setUniflow()
+[rain rate].connect([incoming rain], 1)
+[water tank capacity].addInflow([incoming rain])
+[incoming rain].connect([water tank capacity], 1) # more incoming rain causes an increase in the water tank capacity
 
-[drain_rate] = Variable("1/minute")
-[drain_rate].setEquation("0.1")
-[draining_water] = Flow("liters")
-[draining_water].setEquation("drain_rate")
-[draining_water].setUniflow()
-[drain_rate].connect([draining_water], 1)
-[water_tank_capacity].addOutflow([draining_water])
-[draining_water].connect([water_tank_capacity], 0) # more draining water causes a decrease in the water tank capacity
+[drain rate] = Variable("1/minute")
+[drain rate].setEquation("0.1")
+[draining water] = Flow("liters")
+[draining water].setEquation("drain_rate")
+[draining water].setUniflow()
+[drain rate].connect([draining water], 1)
+[water tank capacity].addOutflow([draining water])
+[draining water].connect([water tank capacity], 0) # more draining water causes a decrease in the water tank capacity
 \`\`\`
 `
 
@@ -298,8 +291,11 @@ When identifying causal relationships in a provided scenario, assign a positive 
   Example 1: Decrease in cause -> increase in effect = NEGATIVE
   Example 2: Increase in cause -> decrease in effect = NEGATIVE
 
-When building upon user-provided models: make sure to understand the difference between adding components and modifying existing ones!
-Take care when modifying existing code lines and document all changes made to them.
+IMPORTANT: When modifying user-generated models, try to make as few changes to existing components as possible.
+- Do not rename existing components or change their equations/units unless the user explicitly and clearly tells you to do so
+- Do not delete components unless explicitly instructed to do so.
+In general, ALWAYS prefer adding new components and connections rather than modifying existing ones, UNLESS the user explicitly says otherwise.
+If you do make any modifications, take care when modifying existing code lines and document all changes made to them.
 
 Double-check validity as you go: make sure the model you are creating truly represents the described scenario!
 `
@@ -313,7 +309,7 @@ In particular, watch out for these common errors in SFD models:
 - Component Type Errors:
    - Simple sums that do not accumulate (i.e. total population calculated by adding two stocks) MUST be variables, NOT stocks
    - Remember, stocks represent accumulations via flows, while sums are algebraic calculations
-- Averaging Function Errors:
+- Averaging Function Errors (in XMILE equations):
    - Use the SMOOTH function for moving averages
    - Do not use DELAY1 or DELAY3 for averaging (delays only shift time, they don't average)
 `
@@ -510,6 +506,55 @@ Please generate stock-and-flow models (SFDs) from user-provided queries to the b
         }
     }
 
+    #splitArgsByComma(str) {
+        const args = [];
+        let cur = "";
+        let depth = 0;
+        let quoteChar = null;
+
+        for (let i = 0; i < str.length; i++) {
+            const char = str[i];
+
+            if (quoteChar) {
+                cur += char;
+                if (char === "\\") {
+                    cur += str[++i];
+                    continue;
+                }
+                if (char === quoteChar) quoteChar = null;
+                continue;
+            }
+
+            if (char === '"' || char === "'" || char === "`") {
+                quoteChar = char;
+                cur += char;
+                continue;
+            }
+            if (char === "(" || char === "[" || char === "{") {
+                depth++;
+                cur += char;
+                continue;
+            }
+
+            if (char === ")" || char === "]" || char === "}") {
+                depth--;
+                cur += char;
+                continue;
+            }
+
+            if (char === "," && depth === 0) {
+                args.push(cur.trim());
+                cur = "";
+                continue;
+            }
+
+            cur += char;
+        }
+
+        args.push(cur.trim());
+        return args;
+    }
+
     #extractMethodArguments(methodCall, lineNum) {
         // given a method call as a string such as "setEquation("...") # reasoning",
         // extract the method name, arguments, and attached comment (if any).
@@ -538,27 +583,13 @@ Please generate stock-and-flow models (SFDs) from user-provided queries to the b
             idx++;
         }
         if (idx >= trimmed.length) throw new SDCodeError("syntax error (missing parentheses?)", lineNum);
-        const argsRaw = trimmed.slice(leftIdx, idx).split(",").map(s => s.trim());
-        inString = false;
+        const argsRaw = this.#splitArgsByComma(trimmed.slice(leftIdx, idx)).map(s => s.trim());
         for (const arg of argsRaw) {
-            if (inString) {
-                res.args[res.args.length - 1] += arg;
-                if (arg[arg.length - 1] === "\"") {
-                    inString = false;
-                    // remove closing quotation mark
-                    res.args[res.args.length - 1] = res.args[res.args.length - 1].slice(0, res.args[res.args.length - 1]);
-                } else {
-                    res.args[res.args.length - 1] += ",";
-                }
-            }
-            else if (arg.length === 0 || arg === "") continue; // blank argument
+            if (arg.length === 0 || arg === "") continue; // blank argument
             else if (arg[0] === "[") res.args.push(arg);
             else if (arg[0] === "\"") {
                 if (arg.length > 1 && arg[arg.length-1] === "\"") res.args.push(arg.slice(1, arg.length - 1));
-                else {
-                    inString = true;
-                    res.args.push(arg + ",");
-                }
+                else throw new SDCodeError("syntax error (missing quotation mark?)", lineNum);
             } else {
                 const parsedArg = parseFloat(arg);
                 if (isNaN(parsedArg)) {
@@ -612,7 +643,9 @@ Please generate stock-and-flow models (SFDs) from user-provided queries to the b
         const explanation = await marked.parse(originalResponse.explanation);
 
         console.log("===  OUTPUT MODEL ===");
-        console.log(program);
+        for (const line of program) {
+            console.log(line);
+        }
 
         const simSpecs = {
             startTime: null,
@@ -638,7 +671,7 @@ Please generate stock-and-flow models (SFDs) from user-provided queries to the b
             if (line.startsWith("```")) continue; // markdown backticks, ignore
             if (line === "") continue; // blank line/newline, ignore
             if (line[0] === "#") continue; // full comment line, ignore
-
+            
             // shorthand for lineParsed
             const lp = this.#extractMethodArguments(line, lineNum);
             // debug
@@ -646,8 +679,6 @@ Please generate stock-and-flow models (SFDs) from user-provided queries to the b
 
             if (lp.method === "setup") {
                 if (simSpecs.startTime !== null) {
-                    // somehow simSpecs has already been setup?
-                    // either something has gone wrong or the LLM has put two setup commands for whatever reason
                     throw new SDCodeError("duplicate setup command is not allowed", lineNum);
                 }
                 this.#verifyArgumentTypes(lp.args, ["", 0, 0, 0, ["Euler", "RK4"]], lineNum);
@@ -670,7 +701,7 @@ Please generate stock-and-flow models (SFDs) from user-provided queries to the b
                 }
 
                 if (compType.toLowerCase() === "module") {
-                    // TODO: VERIFY NAME IS NOT DUPLICATE IS VALID ETC ETC
+                    // TODO: VERIFY MODULE NAME IS NOT DUPLICATE
                     mdl.modules.push(compName);
                 } else {
                     // TODO: VERIFY NAME IS NOT ALREADY TAKEN
@@ -681,7 +712,7 @@ Please generate stock-and-flow models (SFDs) from user-provided queries to the b
                             { 
                                 units: lp.args[0], 
                                 type: compType.toLowerCase(), 
-                                equation: null // TODO: ENFORCE THAT THIS IS SET LATER
+                                equation: "" // TODO: ENFORCE THAT THIS IS SET LATER
                             }
                         ),
                         ...(compType.toLowerCase() === "stock" && 
@@ -721,10 +752,10 @@ Please generate stock-and-flow models (SFDs) from user-provided queries to the b
                     this.#verifyArgumentTypes(lp.args, [""], lineNum);
                     compObj.equation = lp.args[0];
                 } else if (compMethod === "setUniflow") {
-                    if (compObj.type !== "flow") throw new SDCodeError(`component ${compName} is not flow`);
+                    if (compObj.type !== "flow") throw new SDCodeError(`component ${compName} is not flow`, lineNum);
                     compObj.uniflow = true;
                 } else if (compMethod === "addInflow" || compMethod === "addOutflow") {
-                    if (compObj.type !== "stock") throw new SDCodeError(`component ${compName} is not stock`);
+                    if (compObj.type !== "stock") throw new SDCodeError(`component ${compName} is not stock`, lineNum);
                     this.#verifyArgumentTypes(lp.args, [""], lineNum);
                     const secondComp = this.#cleanComponentName(lp.args[0], lineNum);
                     // TODO: WE DON'T CHECK IF THIS COMPONENT ACTUALLY EXISTS, IF ITS BOTH INFLOW AND OUTFLOW, ETC.
@@ -764,7 +795,7 @@ Please generate stock-and-flow models (SFDs) from user-provided queries to the b
         const declarations = [];
         const ghostDeclarations = [];
         const methodCalls = [];
-        // TODO: ARRANGE IN LOGICAL MANNER
+        const connections = [];
         if (Array.isArray(model.modules)) {
             for (const module of model.modules) {
                 moduleDeclarations.push(`[${module.name}] = new Module()`); // TODO: FIX THIS WITH NESTED MODULES
@@ -772,12 +803,12 @@ Please generate stock-and-flow models (SFDs) from user-provided queries to the b
         }
         for (const varObj of model.variables) {
             if (varObj.crossLevelGhostOf != null && varObj.crossLevelGhostOf.trim() !== "") {
-                ghostDeclarations.push(`[${varObj.name}] = Ghost([${varObj.crossLevelGhostOf.trim()}])`)
+                ghostDeclarations.push(`[${varObj.name}] = Ghost([${varObj.crossLevelGhostOf.trim()}])`);
             } else {
-                 declarations.push(`[${varObj.name}] = ${varObj.type[0].toUpperCase() + varObj.type.slice(1)}("${varObj.units ?? "units"}") # ${varObj.documentation}`);
+                declarations.push(`[${varObj.name}] = ${varObj.type[0].toUpperCase() + varObj.type.slice(1)}("${varObj.units ?? "units"}")${varObj.documentation != null && varObj.documentation.trim() !== "" ? ` # ${varObj.documentation.trim()}` : ""}`);
+                methodCalls.push(`[${varObj.name}].setEquation("${varObj.equation}")`);
             }
-           
-            methodCalls.push(`[${varObj.name}].setEquation("${varObj.equation}")`);
+            
             if (varObj.type === "flow" && varObj.uniflow) {
                 methodCalls.push(`[${varObj.name}].setUniflow()`);
             }
@@ -794,14 +825,16 @@ Please generate stock-and-flow models (SFDs) from user-provided queries to the b
                 }
             }
         }
+        for (const rel of model.relationships) {
+            connections.push(`[${rel.from}].connect([${rel.to}], ${rel.polarity === "+" || rel.polarity === undefined || rel.polarity === null ? 1 : 0})${rel.reasoning != null && rel.reasoning.trim() !== "" ? ` # ${rel.reasoning.trim()}` : ""}`)
+        }
         // long one-liner; apologies
         const program = [`setup("${model.specs.timeUnits ?? "day"}", ${model.specs.startTime ?? 0}, ${model.specs.stopTime ?? 10.0}, ${model.specs.dt ?? 0.25}, "${model.specs.integrationMethod ?? "Euler"}")`]
-            .concat(moduleDeclarations.concat(declarations.concat(ghostDeclarations.concat(methodCalls))));
-        for (const relObj of model.relationships) {
-            program.push(`[${relObj.from}].connect([${relObj.to}], ${(relObj.polarity === undefined ? -1 : (relObj.polarity === "+" ? 1 : 0))})`);
-        }
+            .concat(moduleDeclarations.concat(declarations.concat(ghostDeclarations.concat(methodCalls.concat(connections)))));
         console.log("=== USER-PROVIDED MODEL (CONVERTED TO SDCODE) ===");
-        console.log(program);
+        for (const line of program) {
+            console.log(line);
+        }
         return "```\n" + program.join("\n") + "```"; 
     }
     
@@ -835,7 +868,6 @@ Please generate stock-and-flow models (SFDs) from user-provided queries to the b
 
         // Check if lastModel has actual content (variables or relationships)
         if (lastModel && (lastModel.variables?.length > 0 || lastModel.relationships?.length > 0)) {
-            // TODO: convert this to SDCode
             messages.push({ 
                 role: "assistant", 
                 content: JSON.stringify({ 
