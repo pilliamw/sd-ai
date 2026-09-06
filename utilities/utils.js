@@ -31,6 +31,12 @@ utils.prettyifyName = function(variable) {
 }
 
 utils.sameVars = function(a,b) {
+    // A generated model can omit a variable's name or equation entirely — weak models do
+    // it routinely — and xmileName() then throws on undefined. That exception escapes the
+    // category's evaluate() and takes down the whole eval run, turning one malformed
+    // response into a dead experiment. An absent name matches nothing, which is the only
+    // sensible reading and keeps the failure local to the test being graded.
+    if (typeof a !== 'string' || typeof b !== 'string') return false;
     return utils.caseFold(a) === utils.caseFold(b);
 }
 
@@ -104,7 +110,7 @@ utils.evalsVariableNameMatchesStrict = function(variableName, expectedName) {
 /**
  * Standardized array of gibberish nouns for use across evaluation categories
  */
-utils.evalsGibberishNouns = [ "frimbulator",  "whatajig", "balack", "whoziewhat", "funkado", "maxabizer", "marticatene", "reflupper", "exeminte", "oc", "proptimatire", "priary", "houtal", "poval", "auspong", "dominitoxing", "outrance", "illigent", "yelb", "traze", "pablanksill", "posistorather", "crypteral", "oclate", "reveforly", "yoffa", "buwheal", "geyflorrin", "ih", "aferraron", "paffling", "pershipfulty", "copyring", "dickstonyx", "bellignorance", "hashtockle", "succupserva", "relity", "hazmick", "ku", "obvia", "unliescatice", "gissorm", "phildiscals", "loopnova", "hoza", "arinterpord", "burgination", "perstablintome", "memostorer", "baxtoy", "hensologic", "estintant", "perfecton", "raez", "younjuring"];
+utils.evalsGibberishNouns = [ "frimbulator",  "whatajig", "balack", "whoziewhat", "funkado", "maxabizer", "marticatene", "reflupper", "exeminte", "oc", "proptimatire", "priary", "houtal", "poval", "auspong", "outrance", "illigent", "yelb", "traze", "pablanksill", "posistorather", "crypteral", "oclate", "reveforly", "yoffa", "buwheal", "geyflorrin", "ih", "aferraron", "paffling", "pershipfulty", "copyring", "dickstonyx", "bellignorance", "hashtockle", "succupserva", "relity", "hazmick", "ku", "obvia", "unliescatice", "gissorm", "phildiscals", "loopnova", "hoza", "arinterpord", "burgination", "perstablintome", "memostorer", "baxtoy", "hensologic", "estintant", "perfecton", "raez", "younjuring"];
 
 
 

@@ -16,6 +16,8 @@ import prompts from "prompts";
 import yargs from "yargs";
 import { hideBin } from "yargs/helpers";
 
+import { withCostAccounting } from "../utilities/costAccounting.js";
+import { ANTHROPIC_REFUSAL_PREFIX } from "../utilities/LLMWrapper.js";
 import { printTable, pivotAndUnstack, uniqueFileId } from "./helpers.js";
 import {
   BASELINE_TOKEN_USAGE,
@@ -24,17 +26,18 @@ import {
   applyDefaultLimits,
   loadCategoryTests,
   loadTestsForEngine,
+  createEngineBackoff,
 } from "./runHelpers.js";
 
 import "dotenv/config";
 
 // Running evals: silence the engines' / agent's internal logger so its debug
 // output doesn't interleave with the progress bar and result tables. The logger
-// reads this at construction, and every engine, category, and agent module is
-// pulled in via the dynamic import()s below — all of which run after this line,
-// so the flag is always set in time. WorkerSpawner forwards the same flag into
-// any sandboxed sub-process it spawns. Set SDAI_TEST_MODE explicitly to opt out
-// (e.g. SDAI_TEST_MODE=false) when you need the agent's logs while debugging.
+// re-reads this flag on every call, so it takes effect for modules already
+// imported above as well as the engines and categories loaded dynamically below.
+// WorkerSpawner forwards the same flag into any sandboxed sub-process it spawns.
+// Set SDAI_TEST_MODE explicitly to opt out (e.g. SDAI_TEST_MODE=false) when you
+// need the agent's logs while debugging.
 process.env.SDAI_TEST_MODE ??= 'true';
 
 const argv = yargs(hideBin(process.argv))
@@ -130,6 +133,33 @@ const tests = Object.fromEntries(
   .filter(entry => entry[0] !== undefined)
 );
 
+// A provider 503/429/timeout is a fact about the provider, not about the engine under
+// test, so an errored generation is retried rather than scored as a failure.
+//
+// If it still fails after every retry, that ENGINE CONFIG stops. It does not drop the
+// test and carry on: a leaderboard missing a test scores that engine over a smaller set
+// than the others, which is a silently wrong number rather than an obviously absent one.
+//
+// The stop is scoped to the engine config that failed, not the whole run. One provider
+// being down says nothing about the others, and halting them too used to throw away every
+// test still queued behind their rate limiters — hundreds of tests that would have
+// finished fine. The other configs now run to completion, so the resume has far less to
+// redo. The run as a whole still refuses to publish (see failedTests below): completed
+// work stays in <experiment>_in_progress.jsonl and re-running the same experiment resumes
+// from there, re-attempting only what is missing.
+const MAX_GENERATION_RETRIES = 3;
+const RETRY_BASE_DELAY_MS = 2000;
+
+// Engine configs that have had a test exhaust its retries. Checked at the point of
+// spending so tests still queued behind that config's rate limiter don't buy tokens for a
+// config that is already stopping — while tests of every other config carry on.
+const stoppedEngineConfigs = new Set();
+
+// Retry backoff, held per engine config rather than per test — see createEngineBackoff.
+const engineBackoff = createEngineBackoff();
+
+const failedTests = [];
+
 console.log(chalk.blue("Experiment Configuration:"));
 console.log("Experiment Name: " + experimentResultsName);
 if (isContinuing) {
@@ -137,7 +167,7 @@ if (isContinuing) {
 }
 console.log("Sequential: " + (experiment.sequential || "false"));
 console.log("Verbose: " + experiment.verbose);
-console.log("Break on Error: " + experiment.breakOnError || "false");
+console.log(`On error: retry up to ${MAX_GENERATION_RETRIES}x, then stop and keep progress for resume`);
 console.log();
 
 console.log(chalk.blue("Engine Configurations:"));
@@ -232,6 +262,22 @@ const printEarlyResults = (r) => {
 // reuses its result. Storing the promise lets concurrently-scheduled siblings await one call.
 const generationCache = new Map();
 
+
+/** Fold one attempt's cost into a running total for the test. */
+function addSpend(total, accounting) {
+  if (!accounting) return total;
+  total.totalCost += accounting.totalCost;
+  total.calls += accounting.calls;
+  total.unpricedCalls += accounting.unpricedCalls;
+  for (const [model, per] of Object.entries(accounting.byModel)) {
+    const entry = (total.byModel[model] ??= { calls: 0, cost: 0, unpricedCalls: 0 });
+    entry.calls += per.calls;
+    entry.cost += per.cost;
+    entry.unpricedCalls += per.unpricedCalls;
+  }
+  return total;
+}
+
 const runEngineTests = async ([engineConfigName, engineTests]) => {
   const tokenLimitConfig = {
     tokensPerInterval: engineTests[0].engineConfig.limits.tokensPerMinute,
@@ -247,7 +293,6 @@ const runEngineTests = async ([engineConfigName, engineTests]) => {
 
   const inProgress = new Set();
   const earlyResults = { true: 0, false: 0 };
-  const errorTracker = { lastError: null, retryCount: 0, errorHistory: [] }; // Track last error, retry count, and all errors
   const engineBar = progress.create(engineTests.length, 0, {
     engineConfigName,
     earlyResults: printEarlyResults(earlyResults),
@@ -266,8 +311,7 @@ const runEngineTests = async ([engineConfigName, engineTests]) => {
         tokenLimiter,
         inProgress,
         earlyResults,
-        engineBar,
-        errorTracker
+        engineBar
       );
 
       return [...acc, result];
@@ -281,16 +325,22 @@ const runEngineTests = async ([engineConfigName, engineTests]) => {
           tokenLimiter,
           inProgress,
           earlyResults,
-          engineBar,
-          errorTracker
+          engineBar
         )
       )
     );
   }
 
-  engineBar.update({ inProgress: "[Done]" });
+  // The bar counts skipped tests as progress, so a stopped config still ends at 100%.
+  // Saying [Done] there is what makes a halted run read as a complete one.
+  const stopped = stoppedEngineConfigs.has(engineConfigName);
+  engineBar.update({ inProgress: stopped ? "[STOPPED - resume to finish]" : "[Done]" });
   if (experiment.verbose > 0)
-    console.log(chalk.blue(`Finished all tests for: ${engineConfigName}`));
+    console.log(chalk.blue(
+      stopped
+        ? `Stopped early for: ${engineConfigName} (remaining tests skipped, resume to finish)`
+        : `Finished all tests for: ${engineConfigName}`
+    ));
 
   return testRuns;
 };
@@ -301,8 +351,7 @@ const runSingleTest = async (
   tokenLimiter,
   inProgress,
   earlyResults,
-  engineBar,
-  errorTracker
+  engineBar
 ) => {
   const name = test.testParams["name"];
   const cachedResult = previousResults.find(r => {
@@ -359,118 +408,183 @@ const runSingleTest = async (
       test.testParams["currentModel"],
       additionalParameters,
     ]);
-    const startTime = Date.now();
-    let generationPromise = generationCache.get(generationKey);
-    if (!generationPromise) {
-      generationPromise = (async () => {
-        await requestLimiter.removeTokens(1);
-        await tokenLimiter.removeTokens(totalTokens);
 
-        const engine = await import(
-          `../engines/${test["engineConfig"]["engine"]}/engine.js`
-        );
-        const instance = new engine.default();
+    // Attempt loop. Retries live here rather than in a recursive call with shared state:
+    // the previous version threaded one errorTracker through every test of an engine
+    // config, so in the default parallel mode a retry for one test spent the retry budget
+    // of every other test in flight, and "same error twice" tripped on two unrelated tests.
+    let generateResponse = null;
+    let reusedGeneration = false;
+    const attemptErrors = [];
+    // Every attempt's tokens were really bought, so the row is charged for all of them —
+    // reporting only the successful attempt would understate what the leaderboard cost.
+    const spend = { totalCost: 0, calls: 0, unpricedCalls: 0, byModel: {} };
+    // Engine time, summed over attempts on the same rule as spend: a test that generated
+    // three times really did occupy the engine three times.
+    //
+    // This deliberately excludes everything before the engine call — the rate-limiter
+    // queue and the backoff hold. Those are properties of how the run was scheduled, not
+    // of the engine: with tests queued behind a shared limiter, a test's wait grows with
+    // how many others were queued ahead of it, so including it made `duration` scale with
+    // the size of the experiment and stop being comparable between runs.
+    let generationMs = 0;
 
-        if (experiment.verbose === 2)
-          console.log(
-            chalk.blue(`Rate limit passed ${name}, awaiting engine response`)
+    for (let attempt = 0; attempt <= MAX_GENERATION_RETRIES; attempt++) {
+      let generationPromise = generationCache.get(generationKey);
+      // Whether this test is a sibling reusing a generation another test paid for. It
+      // still reports that generation's full cost below, but only the originator's row
+      // counts toward an experiment total — otherwise one engine call is billed once
+      // per sibling and the total is inflated.
+      reusedGeneration = !!generationPromise;
+      if (!generationPromise) {
+        generationPromise = (async () => {
+          await requestLimiter.removeTokens(1);
+          await tokenLimiter.removeTokens(totalTokens);
+
+          // Checked after the wait, not before it: every parallel test clears the code
+          // above within milliseconds of the run starting, so a check before the wait
+          // would already have passed by the time anything failed.
+          if (stoppedEngineConfigs.has(test.engineConfigName))
+            return { value: { skipped: true }, accounting: null };
+
+          // Another test of this config is backing off; wait it out before adding load.
+          // Re-check the stop afterwards — the hold is long enough for that same test to
+          // have exhausted its retries while we sat here.
+          await engineBackoff.wait(test.engineConfigName);
+          if (stoppedEngineConfigs.has(test.engineConfigName))
+            return { value: { skipped: true }, accounting: null };
+
+          const engine = await import(
+            `../engines/${test["engineConfig"]["engine"]}/engine.js`
           );
+          const instance = new engine.default();
 
-        return instance.generate(
-          test.testParams["prompt"],
-          test.testParams["currentModel"],
-          additionalParameters
-        );
-      })();
-      generationCache.set(generationKey, generationPromise);
-    }
-    let generateResponse = await generationPromise;
+          if (experiment.verbose === 2)
+            console.log(
+              chalk.blue(`Rate limit passed ${name}, awaiting engine response`)
+            );
 
-    // A failed generation must not be cached: drop it so a retry (breakOnError) or a later sibling
-    // regenerates rather than inheriting the failure.
-    if (generateResponse && generateResponse.err) {
+          // Every LLM call made while generating lands in this scope, however deep:
+          // a plain engine's own call, and for an agent engine its conversation turns
+          // plus every engine it drives through a tool. So `accounting` is the whole
+          // price of producing this response, not just the outermost request.
+          // The stopwatch starts here: both rate limiters and the backoff hold are above.
+          const generationStart = Date.now();
+          const generated = await withCostAccounting(() => instance.generate(
+            test.testParams["prompt"],
+            test.testParams["currentModel"],
+            additionalParameters
+          ));
+          // Siblings awaiting this same promise report the generation they are grading,
+          // which is the number they should carry — they did no engine work of their own.
+          return { ...generated, generationMs: Date.now() - generationStart };
+        })();
+        generationCache.set(generationKey, generationPromise);
+      }
+
+      let accounting = null;
+      let attemptMs = 0;
+      try {
+        ({ value: generateResponse, accounting, generationMs: attemptMs } = await generationPromise);
+      } catch (err) {
+        // An engine that throws instead of returning {err} would otherwise reject
+        // Promise.all and take down the whole run. Treat it as any other failure.
+        generateResponse = { err: err?.message ?? String(err) };
+      }
+      addSpend(spend, accounting);
+      // A skipped or thrown attempt carries no timing; it also did no engine work.
+      generationMs += attemptMs ?? 0;
+
+      if (!generateResponse || !generateResponse.err) break;
+
+      // This engine config is stopping already; don't burn retries on top of it.
+      if (stoppedEngineConfigs.has(test.engineConfigName)) break;
+
+      // A failed generation must not be cached: drop it so this retry, or a later
+      // sibling, regenerates rather than inheriting the failure.
       generationCache.delete(generationKey);
+      attemptErrors.push({ attempt: attempt + 1, error: generateResponse.err });
+
+      if (attempt < MAX_GENERATION_RETRIES) {
+        // Backing off matters more than retrying: a 429 or an overloaded provider is
+        // exactly what a fixed short delay walks straight back into.
+        const delay = RETRY_BASE_DELAY_MS * 2 ** attempt;
+        // Hold every test of this engine config, not just this one — see createEngineBackoff.
+        engineBackoff.hold(test.engineConfigName, delay);
+        if (experiment.verbose > 0)
+          console.log(chalk.yellow(
+            `Error on "${name}" (attempt ${attempt + 1}/${MAX_GENERATION_RETRIES + 1}), ` +
+            `holding ${test.engineConfigName} for ${delay / 1000}s: ` +
+            `${JSON.stringify(generateResponse.err).slice(0, 200)}`
+          ));
+        await engineBackoff.wait(test.engineConfigName);
+      }
     }
 
-    // Check for errors in the response
-    if (experiment.breakOnError && generateResponse && generateResponse.err) {
-      const currentErrorStr = JSON.stringify(generateResponse.err);
+    // Never started, because this test's engine config was already stopping when it
+    // reached the front of the rate-limiter queue. Not a result and not a failure — the
+    // resume will pick it up.
+    if (generateResponse && generateResponse.skipped) {
+      inProgress.delete(name);
+      engineBar.increment(1, { inProgress: printProgress(inProgress) });
+      return null;
+    }
 
-      // Increment retry count and add error to history
-      errorTracker.retryCount++;
-      errorTracker.errorHistory.push({
-        attempt: errorTracker.retryCount,
-        error: generateResponse.err,
-        errorStr: currentErrorStr
+    if (generateResponse && generateResponse.err) {
+      // Every attempt failed. Stop this engine config rather than dropping the test: the
+      // completed work is already in the in-progress file, so the right move is to leave it
+      // there for a resume instead of publishing a leaderboard with a hole in it. Every
+      // other engine config keeps running — this one's provider is the thing that failed.
+      //
+      // Tests already in flight are deliberately not cancelled — they have been paid for,
+      // and letting them finish means the resume has less to redo.
+      //
+      // A safety-classifier refusal is the exception: it says this one prompt was declined,
+      // not that the provider is unhealthy, and every other test of the config would have
+      // run fine. Stopping on it cost quantitative-claude-sonnet-5 28 of its 93 rows in one
+      // leaderboard run over a single benign prompt, so record the failure and carry on.
+      if (!generateResponse.err.includes(ANTHROPIC_REFUSAL_PREFIX)) {
+        stoppedEngineConfigs.add(test.engineConfigName);
+      }
+      failedTests.push({
+        engineConfigName: test.engineConfigName,
+        engine: test.engineConfig.engine,
+        category: test.category,
+        group: test.group,
+        name,
+        attempts: attemptErrors,
+        cost: spend,
       });
 
-      // Check if this is the same error as the last one (two in a row)
-      if (errorTracker.lastError === currentErrorStr) {
-        // Same error occurred twice in a row - exit immediately
-        progress.stop();
-        console.clear();
-        console.error(chalk.red(chalk.bold("\n\nERROR: Same error occurred twice in a row")));
-        console.error(chalk.red(`Test name: ${name}`));
-        console.error(chalk.red(`Engine: ${test.engineConfig.engine}`));
-        console.error(chalk.red(`\nAll errors encountered:`));
-
-        // Print all errors from history
-        errorTracker.errorHistory.forEach((entry) => {
-          console.error(chalk.red(`\nAttempt ${entry.attempt}:`));
-          console.error(entry.error);
-        });
-
-        process.exit(1);
-      }
-
-      // Check if we've hit the maximum retry limit (3 retries)
-      if (errorTracker.retryCount >= 3) {
-        progress.stop();
-        console.clear();
-        console.error(chalk.red(chalk.bold("\n\nERROR: Maximum retry limit (3) reached")));
-        console.error(chalk.red(`Test name: ${name}`));
-        console.error(chalk.red(`Engine: ${test.engineConfig.engine}`));
-        console.error(chalk.red(`\nAll errors encountered:`));
-
-        // Print all errors from history
-        errorTracker.errorHistory.forEach((entry) => {
-          console.error(chalk.red(`\nAttempt ${entry.attempt}:`));
-          console.error(entry.error);
-        });
-
-        process.exit(1);
-      }
-
-      // Different error - store it and retry
-      errorTracker.lastError = currentErrorStr;
-      if (experiment.verbose > 0) {
-        console.log(chalk.yellow(`\nWarning: Error occurred for test "${name}" (retry ${errorTracker.retryCount}/3), retrying...`));
-        console.log(chalk.yellow(`Error: ${currentErrorStr}`));
-      }
-
-      // Wait a bit before retrying
-      await new Promise(resolve => setTimeout(resolve, 2000));
-
-      // Retry the same test recursively
-      return runSingleTest(
-        test,
-        requestLimiter,
-        tokenLimiter,
-        inProgress,
-        earlyResults,
-        engineBar,
-        errorTracker
-      );
+      inProgress.delete(name);
+      engineBar.increment(1, { inProgress: printProgress(inProgress) });
+      return null;
     }
 
-    // Success - clear error tracker
-    errorTracker.lastError = null;
-    errorTracker.retryCount = 0;
-    errorTracker.errorHistory = [];
-
     testWithResult = structuredClone(test);
-    testWithResult["duration"] = Date.now() - startTime;
+    // Engine time only — see generationMs above. Not schedule-to-done: that included the
+    // rate-limiter queue, which is why this used to grow with the number of tests in a run.
+    testWithResult["duration"] = generationMs;
     testWithResult["generatedResponse"] = generateResponse || {};
+    testWithResult["cost"] = {
+      // USD for the generation behind this test, summed over every attempt it took.
+      // `unpricedCalls` is what keeps this honest: a call with no price contributes
+      // nothing to the total, so a non-zero count means `total` is a lower bound.
+      total: spend.totalCost,
+      calls: spend.calls,
+      unpricedCalls: spend.unpricedCalls,
+      byModel: spend.byModel,
+      reusedGeneration,
+      ...(attemptErrors.length > 0 ? { failedAttempts: attemptErrors.length } : {}),
+    };
+
+    if (experiment.verbose === 2)
+      console.log(
+        chalk.blue(`Cost for ${name}: $${spend.totalCost.toFixed(6)} over ${spend.calls} LLM call(s)`) +
+        (spend.unpricedCalls > 0 ? chalk.yellow(` (${spend.unpricedCalls} unpriced — total is a lower bound)`) : "") +
+        (attemptErrors.length > 0 ? chalk.yellow(` [${attemptErrors.length} failed attempt(s) included]`) : "") +
+        (reusedGeneration ? chalk.gray(" [reused a sibling test's generation]") : "")
+      );
 
     if (experiment.verbose === 2) {
       console.log(
@@ -543,7 +657,56 @@ const output = experiment.sequential
 
 progress.stop();
 
-const responses = output.flat(1);
+// Dropped tests come back as null (see runSingleTest): a provider outage must not
+// appear as a scored zero, so those rows never enter the results at all.
+const responses = output.flat(1).filter(Boolean);
+// A test exhausted its retries. Everything that finished is already in the in-progress
+// file; nothing is summarised or published, and that file is deliberately left in place
+// so re-running the same experiment resumes from it.
+if (failedTests.length > 0) {
+  const completed = responses.length;
+  console.log();
+  console.log(chalk.red(chalk.bold(
+    `Stopped: ${failedTests.length} test(s) failed all ${MAX_GENERATION_RETRIES + 1} attempts.`
+  )));
+  console.log();
+
+  const byConfig = {};
+  for (const f of failedTests) (byConfig[f.engineConfigName] ??= []).push(f);
+
+  // Scored rows per config, so the "stopped after N of M" line below reports what actually
+  // landed rather than the progress bar's count, which includes the tests it skipped.
+  const scoredByConfig = {};
+  for (const r of responses) scoredByConfig[r.engineConfigName] = (scoredByConfig[r.engineConfigName] ?? 0) + 1;
+
+  for (const [configName, failures] of Object.entries(byConfig)) {
+    const scored = scoredByConfig[configName] ?? 0;
+    const planned = tests[configName]?.length ?? 0;
+    console.log(chalk.red(chalk.bold(
+      `  ${configName} (${failures[0].engine}) — stopped after ${scored} of ${planned} tests`
+    )));
+    for (const f of failures) {
+      console.log(chalk.red(`    ${f.category} / ${f.group} / ${f.name}`));
+      for (const attempt of f.attempts) {
+        console.log(chalk.gray(`      attempt ${attempt.attempt}: ${JSON.stringify(attempt.error).slice(0, 300)}`));
+      }
+    }
+    console.log();
+  }
+
+  const errorFile = `${experimentResultsName}_errors.json`;
+  fs.writeFileSync(errorFile, JSON.stringify({ failed: failedTests }, null, 2));
+
+  const finished = Object.keys(tests).filter(name => !stoppedEngineConfigs.has(name));
+  if (finished.length > 0)
+    console.log(chalk.green(`Ran to completion: ${finished.join(", ")}`));
+  console.log(chalk.yellow(`${completed} completed test(s) kept in ${experimentResultsName}${inProgressFileSuffix}`));
+  console.log(chalk.yellow(`Full error detail written to ${errorFile}`));
+  console.log(chalk.yellow(`Resume with: npm run evals -- -e ${argv.experiment}`));
+  console.log();
+  process.exit(1);
+}
+
 const results = new dataForge.DataFrame({ values: responses });
 
 
@@ -552,7 +715,20 @@ fs.writeFileSync(
   `${experimentResultsName}_full_results.json`,
   JSON.stringify({ results: responses }, null, 2)
 );
-fs.unlinkSync(`${experimentResultsName}${inProgressFileSuffix}`);
+// force: nothing was appended if every result came from the resume cache, and an ENOENT
+// here would throw away a completed run at the last step.
+fs.rmSync(`${experimentResultsName}${inProgressFileSuffix}`, { force: true });
+// An errors file from the run this one resumed is now answered and would otherwise sit
+// next to the results implying failures that no longer exist.
+fs.rmSync(`${experimentResultsName}_errors.json`, { force: true });
+
+// Nothing to score. Not the error path (that exits above with progress preserved) — this
+// is an experiment whose categories selected no tests at all. The summary tables pivot
+// over the results and throw on an empty frame, which would bury the real problem.
+if (responses.length === 0) {
+  console.error(chalk.red(chalk.bold("No test produced a result — nothing to summarise.")));
+  process.exit(1);
+}
 
 const engineFailureTypes = [];
 results.forEach((result) => {
@@ -582,6 +758,49 @@ fs.writeFileSync(
     (v) => v.count()
   ).toCSV()
 );
+
+// Cost per engine config. Only originator rows are summed — a sibling reusing a cached
+// generation carries that generation's full cost on its own row for visibility, but
+// adding it here would bill one engine call once per sibling.
+const costByEngineConfig = {};
+results.forEach((result) => {
+  const cost = result["cost"];
+  if (!cost || cost.reusedGeneration) return;
+  const entry = (costByEngineConfig[result["engineConfigName"]] ??= {
+    generations: 0, llmCalls: 0, unpricedCalls: 0, total: 0,
+  });
+  entry.generations += 1;
+  entry.llmCalls += cost.calls;
+  entry.unpricedCalls += cost.unpricedCalls;
+  entry.total += cost.total;
+});
+
+const costRows = Object.entries(costByEngineConfig).map(([engineConfigName, e]) => ({
+  engineConfigName,
+  generations: e.generations,
+  llmCalls: e.llmCalls,
+  "cost ($)": e.total.toFixed(4),
+  "$/generation": (e.total / (e.generations || 1)).toFixed(4),
+  // Loud rather than absent: a non-zero count means the cost column understates.
+  "unpriced calls": e.unpricedCalls,
+}));
+
+if (costRows.length > 0) {
+  const grandTotal = Object.values(costByEngineConfig).reduce((a, e) => a + e.total, 0);
+  const unpriced = Object.values(costByEngineConfig).reduce((a, e) => a + e.unpricedCalls, 0);
+  console.log();
+  console.log(chalk.blue("Cost:"));
+  const costFrame = new dataForge.DataFrame({ values: costRows });
+  printTable(costFrame);
+  console.log(chalk.bold(`Total: $${grandTotal.toFixed(4)}`));
+  if (unpriced > 0) {
+    console.log(chalk.yellow(
+      `Warning: ${unpriced} LLM call(s) used a model with no pricing.js entry — the totals above are a lower bound.`
+    ));
+  }
+  console.log();
+  fs.writeFileSync(`${experimentResultsName}_cost.csv`, await costFrame.toCSV());
+}
 
 const summary = pivotAndUnstack(
   results.withSeries({

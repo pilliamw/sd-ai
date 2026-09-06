@@ -17,6 +17,17 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath, pathToFileURL } from 'url';
 import { execSync } from 'child_process';
+import {
+  LEADERBOARD_MODES,
+  LEADERBOARD_GENERATIONS,
+  generationsIn,
+  generationOf,
+  findGeneration,
+} from '../../evals/leaderboardGenerations.js';
+import {
+  leaderboardResultsPath,
+  readLeaderboardFile,
+} from '../../evals/leaderboardFile.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -217,11 +228,28 @@ async function generateEvals() {
       link = null;
     }
 
+    // How the category's tests are built and run, what its evaluator checks, and how those
+    // checks combine into a verdict. Rendered on every test page, and read from the category
+    // module rather than restated here so the explanation cannot drift from `evaluate`.
+    let methodology = null;
+    try {
+      methodology = mod.methodology ? mod.methodology() : null;
+    } catch (e) {
+      console.warn(`  ! eval category "${name}" methodology() threw: ${e.message}`);
+      methodology = null;
+    }
+    if (!methodology) {
+      // Surfaced rather than passed over: a category with no methodology renders a test page
+      // that cannot say how it is graded, which is the thing these pages exist to explain.
+      console.warn(`  ! eval category "${name}" exports no methodology()`);
+    }
+
     categories.push({
       name,
       groups,
       description,
       link,
+      methodology,
       source: `${GH_BASE}/evals/categories/${name}.js`,
       firstTestUrl,
     });
@@ -316,17 +344,67 @@ async function generateAgents() {
 
 /* -------------------------------------------------------------- leaderboards */
 
+// The model(s) a config ran with. Most engines name one in `underlyingModel`. The agent
+// harness (`test-agent-build`) instead names a model per tool-and-difficulty slot under
+// `toolModels`, so there is no single field to read — the distinct set across those slots
+// is the honest answer. Usually that set has one member, but a config is free to mix (a
+// larger model for hard builds, say) and collapsing that to one name would misattribute
+// the score. An engine that drives no LLM at all yields an empty list.
+function modelsForConfig(engineConfig) {
+  const params = engineConfig.additionalParameters ?? {};
+  if (params.underlyingModel) return [params.underlyingModel];
+  if (params.toolModels) {
+    const named = Object.values(params.toolModels)
+      .flatMap((slot) => Object.values(slot ?? {}))
+      .filter(Boolean);
+    return [...new Set(named)];
+  }
+  return [];
+}
+
+// Agent runs go through a harness engine (`test-agent-build`, `test-agent-discuss`) whose
+// id is the same for every agent and every board, so the engine name cannot say which
+// agent produced a row. The config names the agent, so that is recorded here and the site
+// is spared having to infer it from an id or a naming convention.
+function agentForConfig(engineConfig) {
+  return engineConfig.additionalParameters?.agentName ?? null;
+}
+
+/**
+ * Whether a config was run against a locally-hosted model rather than a hosted API.
+ *
+ * Local runs are launched through LM Studio / llama.cpp, and the config name records the
+ * knobs that only exist there: an explicit seed, a quantisation, a context size. No
+ * hosted-API config carries any of them — `qualitative-qwen3.5-397b` is the same weights
+ * served over an API, and stays on the board. The model id is checked too, for the runs
+ * whose weights were loaded straight off a disk path.
+ *
+ * This is a property of the run, so it is settled here rather than re-derived by pattern
+ * matching in the UI.
+ */
+function isLocallyHosted(configName, llmModels) {
+  if (/-seed\d+/i.test(configName)) return true;
+  if (/(^|[-_])(gguf|mlx|q4_k_m|q4ks|q6k|iq4nl)([-_]|$)/i.test(configName)) return true;
+  return llmModels.some((model) => model.startsWith('/') || /(^|[-_])mlx([-_]|\d|$)/i.test(model));
+}
+
 // Port of the Leaderboard page's processLeaderboardData: reduce the (huge)
 // full-results files to the small per-engine aggregate the UI actually renders.
 function processLeaderboard(data) {
   const engineStats = {};
+  // Cost and generation are tracked in their own maps rather than on engineStats: the
+  // category list below is inferred from "every key that isn't a known non-category",
+  // so an extra key there would be rendered as a benchmark column.
+  const costStats = {};
+  const generationStats = {};
   const categories = new Set();
   const categoryFirstTests = {};
 
   for (const test of data.results) {
     const engineConfigName = test.engineConfigName;
     const engineName = test.engineConfig.engine;
-    const llmModel = test.engineConfig.additionalParameters?.underlyingModel || 'N/A';
+    const llmModels = modelsForConfig(test.engineConfig);
+    const agentName = agentForConfig(test.engineConfig);
 
     if (!categoryFirstTests[test.category]) {
       categoryFirstTests[test.category] = {
@@ -337,7 +415,7 @@ function processLeaderboard(data) {
     }
 
     if (!engineStats[engineConfigName]) {
-      engineStats[engineConfigName] = { speeds: [], engineName, llmModel };
+      engineStats[engineConfigName] = { speeds: [], engineName, llmModels, agentName };
     }
 
     if (!(test.category in engineStats[engineConfigName])) {
@@ -348,6 +426,24 @@ function processLeaderboard(data) {
     engineStats[engineConfigName][test.category].passes += test.pass ? 1 : 0;
     engineStats[engineConfigName][test.category].count += 1;
     engineStats[engineConfigName].speeds.push(test.duration);
+
+    // A newer result overwrites an older one, so a config only partly re-run holds a
+    // mix. Counting per generation is what lets the table say which rows are still on
+    // older numbers instead of implying the whole config was measured at once.
+    const gen = generationOf(test);
+    const genCounts = (generationStats[engineConfigName] ??= {});
+    genCounts[gen] = (genCounts[gen] ?? 0) + 1;
+
+    const cost = (costStats[engineConfigName] ??= { total: 0, priced: 0, unpricedCalls: 0, tests: 0 });
+    cost.tests += 1;
+    if (test.cost) {
+      cost.priced += 1;
+      // Only originator rows are summed. A sibling test that reused a cached generation
+      // carries that generation's full cost on its own row, so adding it would bill one
+      // engine call once per sibling.
+      if (!test.cost.reusedGeneration) cost.total += test.cost.total;
+      cost.unpricedCalls += test.cost.unpricedCalls;
+    }
   }
 
   const engines = Object.entries(engineStats).map(([configName, stats]) => {
@@ -355,7 +451,7 @@ function processLeaderboard(data) {
     let totalCount = 0;
     const scores = Object.fromEntries(
       Object.keys(stats)
-        .filter((e) => !['speeds', 'engineName', 'llmModel'].includes(e))
+        .filter((e) => !['speeds', 'engineName', 'llmModels', 'agentName'].includes(e))
         .map((category) => {
           totalPasses += stats[category].passes;
           totalCount += stats[category].count;
@@ -367,7 +463,36 @@ function processLeaderboard(data) {
     const speed =
       stats.speeds.reduce((sum, a) => sum + a, 0) / stats.speeds.length / 1000;
 
-    return { configName, engineName: stats.engineName, llmModel: stats.llmModel, speed, score, ...scores };
+    // Total spend spread over every test, so the figure is comparable between engines
+    // that ran different numbers of tests. Null — not zero — for results produced before
+    // evals captured cost, so the UI can say "unknown" rather than "free".
+    const cost = costStats[configName];
+    const hasCost = cost && cost.priced > 0;
+    const costTotal = hasCost ? cost.total : null;
+    const costPerTest = hasCost ? cost.total / cost.tests : null;
+
+    const generationCounts = generationStats[configName] ?? {};
+    const presentGenerations = generationsIn(
+      Object.entries(generationCounts).flatMap(([id, n]) => Array(n).fill({ generation: id }))
+    );
+
+    return {
+      configName, engineName: stats.engineName,
+      // The agent this config ran, or null for a plain engine.
+      agentName: stats.agentName,
+      // Both shapes: `llmModels` for the UI to render one badge per model, `llmModel` as
+      // the flattened string the charts and the engine pages already read.
+      llmModels: stats.llmModels,
+      llmModel: stats.llmModels.length ? stats.llmModels.join(' + ') : 'N/A',
+      isLocal: isLocallyHosted(configName, stats.llmModels),
+      speed, score,
+      generationCounts,
+      generations: presentGenerations,
+      costTotal, costPerTest,
+      // Non-zero means a model had no pricing.js entry, so the two figures above understate.
+      costUnpricedCalls: hasCost ? cost.unpricedCalls : 0,
+      ...scores,
+    };
   });
 
   engines.sort((a, b) => b.score - a.score);
@@ -375,18 +500,70 @@ function processLeaderboard(data) {
   return { engines, categories: Array.from(categories), categoryFirstTests };
 }
 
+// One file per leaderboard. A newer result overwrites the older one for the same test,
+// so the file already holds exactly one current answer per test and needs no bucketing —
+// it is aggregated whole. The generation tag rides along per engine so the table can
+// flag which engines are still carrying older numbers.
+//
+// The published boards are gzipped and read through `evals/leaderboardFile.js`, the same
+// way the API route reads them. Everything downstream of that — this aggregation, the
+// generated `leaderboards.json`, the React pages — is unchanged: the site never sees the
+// raw files, only the small pre-aggregated JSON written here.
 function generateLeaderboards() {
-  const modes = ['cld', 'sfd', 'discussion'];
   const out = {};
-  for (const mode of modes) {
-    const fp = path.join(REPO_ROOT, 'evals', 'results', `leaderboard_${mode}_full_results.json`);
+  for (const mode of LEADERBOARD_MODES) {
+    const fp = leaderboardResultsPath(mode);
     if (!fs.existsSync(fp)) {
       console.warn(`  ! no leaderboard results for "${mode}"`);
       out[mode] = null;
       continue;
     }
-    const data = JSON.parse(fs.readFileSync(fp, 'utf8'));
-    out[mode] = processLeaderboard(data);
+
+    const data = readLeaderboardFile(fp);
+    const processed = processLeaderboard(data);
+
+    const counts = {};
+    // Distinct categories and tests per generation. The benchmark grew between rounds, and
+    // by different amounts on different boards — SFD went from 5 categories to 12 while CLD
+    // stayed at 4 — so whether a later generation is scored over harder ground is a fact
+    // about each board, not a blanket claim the UI can make for all of them.
+    const catsPerGen = {};
+    const testsPerGen = {};
+    for (const row of data.results) {
+      const id = generationOf(row);
+      counts[id] = (counts[id] ?? 0) + 1;
+      (catsPerGen[id] ??= new Set()).add(row.category);
+      (testsPerGen[id] ??= new Set()).add(`${row.category}/${row.group}/${row.testParams.name}`);
+    }
+
+    const generations = generationsIn(data.results).map((id) => {
+      const declared = findGeneration(id);
+      if (!declared) {
+        // Surfaced rather than dropped: an undeclared id is almost always a typo in a
+        // collect command, and silently ignoring it would look like data loss.
+        console.warn(`  ! "${mode}" has results tagged "${id}", which is not in LEADERBOARD_GENERATIONS`);
+      }
+      return {
+        id,
+        label: declared?.label ?? id,
+        description: declared?.description ?? null,
+        caveat: declared?.caveat ?? null,
+        count: counts[id],
+        categoryCount: catsPerGen[id]?.size ?? 0,
+        testCount: testsPerGen[id]?.size ?? 0,
+      };
+    });
+
+    console.log(
+      `  ${mode}: ${processed.engines.length} engines, ` +
+      `${generations.map((g) => `${g.id} (${g.count} results)`).join(', ')}`
+    );
+    out[mode] = {
+      ...processed,
+      generations,
+      // generationsIn orders by the registry, so the last present one is the newest.
+      currentGeneration: generations[generations.length - 1]?.id ?? null,
+    };
   }
   return out;
 }

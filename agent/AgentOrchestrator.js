@@ -14,7 +14,18 @@ const loadClaudeAgentSdk = async () => _claudeAgentSdk ??= await import('@anthro
 let _googleGenai;
 const loadGoogleGenai = async () => _googleGenai ??= await import('@google/genai');
 let _googleAdk;
-const loadGoogleAdk = async () => _googleAdk ??= await import('@google/adk');
+// @google/adk logs every outbound request at INFO, and it cannot be turned off with
+// config: its winston levels are numbered the other way round from winston's own
+// convention (info=1, error=3), so the `level: 'error'` it configures admits INFO
+// rather than filtering it. Hand it the library's no-op logger when we are meant to be
+// quiet — done here, at the one place the module is loaded, so it is silenced before
+// the first request goes out. Failures still reach the eval through the thrown error.
+const loadGoogleAdk = async () => {
+  if (_googleAdk) return _googleAdk;
+  _googleAdk = await import('@google/adk');
+  if (logger.isTestMode) _googleAdk.setLogger(null);
+  return _googleAdk;
+};
 let _openRouterSdk;
 const loadOpenRouterSdk = async () => _openRouterSdk ??= await import('@openrouter/sdk');
 let _openRouterAgent;
@@ -39,6 +50,7 @@ import { BuiltInToolProvider, SDK_FILE_TOOL_TWINS } from './tools/BuiltInToolPro
 import { DynamicToolProvider } from './tools/DynamicToolProvider.js';
 import {
   createAgentTextMessage,
+  createAgentProgressMessage,
   createToolCallNotificationMessage,
   createToolCallCompletedMessage,
   createAgentCompleteMessage,
@@ -235,7 +247,7 @@ export class AgentOrchestrator {
     cache_read_input_tokens: 0,
   };
 
-  constructor(sessionManager, sessionId, sendToClient, agentConfig, provider = config.agentDefaultProvider, intelligence = null) {
+  constructor(sessionManager, sessionId, sendToClient, agentConfig, provider = config.agentDefaultProvider, intelligence = null, toolModels) {
     this.sessionManager = sessionManager;
     this.sessionId = sessionId;
     this.sendToClient = sendToClient;
@@ -250,7 +262,17 @@ export class AgentOrchestrator {
     // the tools capture it in a closure at registration time but read it inside the
     // handler — which is what lets a mid-conversation change reach the next tool
     // call without re-registering every tool.
-    this.agentProfile = { provider: this.provider, intelligence: this.intelligence };
+    //
+    // `toolModels`, when a caller supplies one, pins the engine-tool lane for the
+    // whole session and outranks every config lookup (see selectEngineModel). No
+    // product path passes it; it is how the eval runner holds the engine models
+    // fixed across an experiment. The key is omitted when unset so a normal
+    // session's profile keeps exactly the shape it had before.
+    this.agentProfile = {
+      provider: this.provider,
+      intelligence: this.intelligence,
+      ...(toolModels ? { toolModels } : {})
+    };
 
     // SDK-specific properties (for SDK mode)
     this.abortController = null;
@@ -1407,61 +1429,7 @@ model tools.`;
         ));
 
         // Send additional text notification for slow tools
-        if (block.name === 'create_visualization') {
-          const vizType = block.input.useAICustom ? 'AI-generated custom' : (block.input.type || 'standard');
-          const title = block.input.title || 'visualization';
-          await this.sendToClient(createAgentTextMessage(
-            this.sessionId,
-            `Creating ${vizType} visualization: "${title}"... This may take a moment.`,
-            false
-          ));
-        } else if (block.name === 'draw_causal_loop_diagram') {
-          await this.sendToClient(createAgentTextMessage(
-            this.sessionId,
-            `Drawing causal loop diagram: "${block.input.title || 'Causal Loop Diagram'}"... This may take a moment.`,
-            false
-          ));
-        } else if (block.name === 'get_variable_data') {
-          const varCount = block.input.variableNames?.length || 0;
-          const runCount = block.input.runIds?.length || 0;
-          await this.sendToClient(createAgentTextMessage(
-            this.sessionId,
-            `Retrieving data for ${varCount} variable${varCount !== 1 ? 's' : ''} from ${runCount} run${runCount !== 1 ? 's' : ''}...`,
-            false
-          ));
-        } else if (block.name === 'get_feedback_information') {
-          const runCount = block.input.runIds?.length || 0;
-          const runText = runCount === 0 ? 'all runs' : `${runCount} run${runCount !== 1 ? 's' : ''}`;
-          await this.sendToClient(createAgentTextMessage(
-            this.sessionId,
-            `Analyzing feedback loops for ${runText}... This may take a moment.`,
-            false
-          ));
-        } else if (block.name === 'run_model') {
-          await this.sendToClient(createAgentTextMessage(
-            this.sessionId,
-            `Running model simulation...`,
-            false
-          ));
-        } else if (block.name === 'discuss_model_with_seldon') {
-          await this.sendToClient(createAgentTextMessage(
-            this.sessionId,
-            `Consulting Seldon for expert analysis...`,
-            false
-          ));
-        } else if (block.name === 'discuss_model_across_runs') {
-          await this.sendToClient(createAgentTextMessage(
-            this.sessionId,
-            `Analyzing model behavior across runs...`,
-            false
-          ));
-        } else if (block.name === 'discuss_with_mentor') {
-          await this.sendToClient(createAgentTextMessage(
-            this.sessionId,
-            `Consulting Seldon mentor for guidance...`,
-            false
-          ));
-        }
+        await this.#sendSlowToolMessageHelper(block.name, block.input);
 
         // Execute tool
         const toolResult = await this.executeToolCallHelper(block, builtInTools, dynamicTools);
@@ -2158,6 +2126,11 @@ ${lines.join('\n')}`);
       // Client tools are re-listed alongside the built-ins even though nothing about
       // them can change mid-turn, because splitting the two would mean two answers to
       // "what is live right now" and only one of them kept current.
+      //
+      // What this list must never do is SHRINK around a name the model is still
+      // holding: ADK ends the invocation on a call it cannot resolve, so the
+      // model-state gates are enforced when a tool runs here, not by omission.
+      // getAdkTools has the whole story.
       const adkToolset = await createAdkLiveToolset(async () => [
         ...await this.builtInToolProvider.getAdkTools(mode),
         // The same set the roster was built against a few lines up, so what this
@@ -2375,25 +2348,25 @@ ${lines.join('\n')}`);
   async #sendSlowToolMessageHelper(toolName, args) {
     if (toolName === 'create_visualization') {
       const vizType = args?.useAICustom ? 'AI-generated custom' : (args?.type || 'standard');
-      await this.sendToClient(createAgentTextMessage(this.sessionId, `Creating ${vizType} visualization: "${args?.title || 'visualization'}"... This may take a moment.`, false));
+      await this.sendToClient(createAgentProgressMessage(this.sessionId, `Creating ${vizType} visualization: "${args?.title || 'visualization'}"... This may take a moment.`));
     } else if (toolName === 'draw_causal_loop_diagram') {
-      await this.sendToClient(createAgentTextMessage(this.sessionId, `Drawing causal loop diagram: "${args?.title || 'Causal Loop Diagram'}"... This may take a moment.`, false));
+      await this.sendToClient(createAgentProgressMessage(this.sessionId, `Drawing causal loop diagram: "${args?.title || 'Causal Loop Diagram'}"... This may take a moment.`));
     } else if (toolName === 'get_variable_data') {
       const varCount = args?.variableNames?.length || 0;
       const runCount = args?.runIds?.length || 0;
-      await this.sendToClient(createAgentTextMessage(this.sessionId, `Retrieving data for ${varCount} variable${varCount !== 1 ? 's' : ''} from ${runCount} run${runCount !== 1 ? 's' : ''}...`, false));
+      await this.sendToClient(createAgentProgressMessage(this.sessionId, `Retrieving data for ${varCount} variable${varCount !== 1 ? 's' : ''} from ${runCount} run${runCount !== 1 ? 's' : ''}...`));
     } else if (toolName === 'get_feedback_information') {
       const runCount = args?.runIds?.length || 0;
       const runText = runCount === 0 ? 'all runs' : `${runCount} run${runCount !== 1 ? 's' : ''}`;
-      await this.sendToClient(createAgentTextMessage(this.sessionId, `Analyzing feedback loops for ${runText}... This may take a moment.`, false));
+      await this.sendToClient(createAgentProgressMessage(this.sessionId, `Analyzing feedback loops for ${runText}... This may take a moment.`));
     } else if (toolName === 'run_model') {
-      await this.sendToClient(createAgentTextMessage(this.sessionId, `Running model simulation...`, false));
+      await this.sendToClient(createAgentProgressMessage(this.sessionId, `Running model simulation...`));
     } else if (toolName === 'discuss_model_with_seldon') {
-      await this.sendToClient(createAgentTextMessage(this.sessionId, `Consulting Seldon for expert analysis...`, false));
+      await this.sendToClient(createAgentProgressMessage(this.sessionId, `Consulting Seldon for expert analysis...`));
     } else if (toolName === 'discuss_model_across_runs') {
-      await this.sendToClient(createAgentTextMessage(this.sessionId, `Analyzing model behavior across runs...`, false));
+      await this.sendToClient(createAgentProgressMessage(this.sessionId, `Analyzing model behavior across runs...`));
     } else if (toolName === 'discuss_with_mentor') {
-      await this.sendToClient(createAgentTextMessage(this.sessionId, `Consulting Seldon mentor for guidance...`, false));
+      await this.sendToClient(createAgentProgressMessage(this.sessionId, `Consulting Seldon mentor for guidance...`));
     }
   }
 

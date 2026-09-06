@@ -16,6 +16,17 @@ export const anthropic = {
     cacheReadInputTokens: 1.0,
     outputTokens: 50.00,
   },
+  'claude-fable-5-1': {
+    inputTokens: 10.00,
+    cacheCreation5mInputTokens: 12.50,
+    cacheCreation1hInputTokens: 20.00,
+    // 0.25 is correct and is not the 0.1x-of-input every other Claude model uses. Per
+    // the pricing page: "Cache hits and refreshes on Claude Fable 5.1 and Claude Mythos
+    // 5.1 are priced at 0.025x the base input price. All other models use the standard
+    // 0.1x multiplier." Stated here because it looks like a typo otherwise.
+    cacheReadInputTokens: 0.25,
+    outputTokens: 50.00,
+  },
   'claude-fable-5': {
     inputTokens: 10.00,
     cacheCreation5mInputTokens: 12.50,
@@ -129,14 +140,19 @@ export const gemini = {
     cachedTokens: 0.15,
     outputTokens: 9.00,
   },
-  // 3.6 and 3.7 Flash share introductory pricing through 2026-12-31. On
-  // 2027-01-01 both double to 1.50 / 0.15 / 7.50 — update both entries then.
+  // 3.6, 3.7 and 3.8 Flash share introductory pricing through 2026-12-31. On
+  // 2027-01-01 all three double to 1.50 / 0.15 / 7.50 — update every entry then.
   'gemini-3.6-flash': {
     inputTokens: 0.75,
     cachedTokens: 0.075,
     outputTokens: 3.75,
   },
   'gemini-3.7-flash': {
+    inputTokens: 0.75,
+    cachedTokens: 0.075,
+    outputTokens: 3.75,
+  },
+  'gemini-3.8-flash': {
     inputTokens: 0.75,
     cachedTokens: 0.075,
     outputTokens: 3.75,

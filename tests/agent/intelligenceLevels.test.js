@@ -30,13 +30,20 @@ const CONFIG = { path: path.join(__dirname, '../../agent/config/socrates.md') };
 // The values the agent sent before intelligence levels existed. Written as literals
 // rather than read from config, because the whole point is to detect a config edit that
 // silently moves what a legacy client gets.
+// The top rung's model, read from config rather than pinned. The assertions using it are
+// about the ladder moving the model at all, not about which model it lands on, so bumping
+// a model id in config.js should not require a test edit. LEGACY below is the opposite
+// case and stays hardcoded on purpose: those values ARE the pre-feature contract.
+const MAXIMUM_MODEL = config.agentIntelligence.providers.anthropic
+  .find((l) => l.id === 'maximum').model;
+
 const LEGACY = {
   anthropicModel: 'claude-sonnet-5',
   anthropicEffort: 'medium',
   anthropicThinking: { type: 'adaptive' },
-  geminiModel: 'gemini-3.7-flash',
-  geminiToolBuildNormal: 'gemini-3.7-flash low',
-  geminiToolBuildHard: 'gemini-3.7-flash high'
+  geminiModel: 'gemini-3.8-flash',
+  geminiToolBuildNormal: 'gemini-3.8-flash low',
+  geminiToolBuildHard: 'gemini-3.8-flash high'
 };
 
 describe('intelligence ladder — resolution', () => {
@@ -167,6 +174,18 @@ describe('intelligence ladder — engine tool lanes', () => {
     } finally {
       config.agentIntelligence = original;
     }
+  });
+
+  it('prefers a lane carried on the profile over every config lookup', () => {
+    // How an eval pins the engine models for a run: the experiment names the lane and
+    // it must beat the level's own toolModels, the provider entry and the shared table
+    // alike, so a result row is attributable to the model the experiment asked for.
+    const pinned = { build: { normal: 'pinned-a', hard: 'pinned-b' }, nonBuild: { normal: 'pinned-c', hard: 'pinned-d' } };
+    const profile = { provider: 'anthropic', intelligence: 'standard', toolModels: pinned };
+    expect(selectEngineModel(profile, 'normal', 'build')).toBe('pinned-a');
+    expect(selectEngineModel(profile, 'hard', 'nonBuild')).toBe('pinned-d');
+    // And the level no longer moves it — that is the point of pinning.
+    expect(selectEngineModel({ ...profile, intelligence: 'maximum' }, 'normal', 'build')).toBe('pinned-a');
   });
 });
 
@@ -436,7 +455,7 @@ describe('intelligence ladder — provider request shapes', () => {
     await orc.startConversationAnthropicManual('hi');
 
     const req = create.mock.calls[0][0];
-    expect(req.model).toBe('claude-fable-5');
+    expect(req.model).toBe(MAXIMUM_MODEL);
     expect('output_config' in req).toBe(false);
   });
 
@@ -525,7 +544,7 @@ describe('intelligence ladder — changing level mid-conversation', () => {
     await orc.startConversationAnthropicManual('second');
 
     expect(create.mock.calls[0][0].model).toBe('claude-sonnet-5');
-    expect(create.mock.calls[1][0].model).toBe('claude-fable-5');
+    expect(create.mock.calls[1][0].model).toBe(MAXIMUM_MODEL);
   });
 
   it('finishes an in-flight turn on the model it started with', async () => {
@@ -557,7 +576,7 @@ describe('intelligence ladder — changing level mid-conversation', () => {
 
     // ...and the change is not lost — it applies to the next turn.
     await orc.startConversationAnthropicManual('again');
-    expect(create.mock.calls[create.mock.calls.length - 1][0].model).toBe('claude-fable-5');
+    expect(create.mock.calls[create.mock.calls.length - 1][0].model).toBe(MAXIMUM_MODEL);
   });
 
   it('leaves conversation history and the orchestrator instance intact', async () => {
@@ -594,6 +613,23 @@ describe('intelligence ladder — changing level mid-conversation', () => {
     expect(selectEngineModel(orc.agentProfile, 'normal', 'build')).not.toBe(before);
   });
 
+  it('carries a constructor-supplied tool lane onto the live profile', () => {
+    process.env.ANTHROPIC_API_KEY = 'dummy';
+    const pinned = { build: { normal: 'pinned-a', hard: 'pinned-a' }, nonBuild: { normal: 'pinned-a', hard: 'pinned-a' } };
+    orc = new AgentOrchestrator(
+      sessionManager, sessionId, jest.fn().mockResolvedValue(undefined), CONFIG, 'anthropic', 'standard', pinned
+    );
+    expect(selectEngineModel(orc.agentProfile, 'normal', 'build')).toBe('pinned-a');
+    // A level change still applies to the conversation model but must not unpin the tools.
+    orc.setIntelligence('maximum');
+    expect(selectEngineModel(orc.agentProfile, 'normal', 'build')).toBe('pinned-a');
+  });
+
+  it('leaves the profile shape untouched when no lane is supplied', () => {
+    orc = makeOrc('anthropic', 'standard');
+    expect(orc.agentProfile).toEqual({ provider: 'anthropic', intelligence: 'standard' });
+  });
+
   it('drops the Gemini context cache when the model changes', async () => {
     orc = makeOrc('google', 'standard');
     const cachesDelete = jest.fn().mockResolvedValue(undefined);
@@ -610,7 +646,7 @@ describe('intelligence ladder — changing level mid-conversation', () => {
 
     await orc.startConversationGeminiManual('first');
     expect(cachesCreate).toHaveBeenCalledTimes(1);
-    expect(cachesCreate.mock.calls[0][0].model).toBe('gemini-3.7-flash');
+    expect(cachesCreate.mock.calls[0][0].model).toBe('gemini-3.8-flash');
 
     orc.setIntelligence('maximum');
     await orc.startConversationGeminiManual('second');

@@ -27,6 +27,7 @@
  * @module categories/conformance
  */
 
+import utils from '../../utilities/utils.js';
 import { validateEvaluationResult } from '../evaluationSchema.js';
 
 /**
@@ -99,16 +100,42 @@ Distracted Driving: Using a phone, texting, or eating while driving can increase
 
 /**
  * From a list of relationships extract all of the variables
+ *
+ * Keyed by normalized name so two spellings of one variable count once, but each key keeps
+ * the name as the model wrote it, because a failure that reports "colonialidentity" is
+ * telling the reader about the comparison rather than about their model.
  * @param {Array<Object>} list List of relationships in form of {from: <string>, to: <string> }
- * @returns {Set<String>} A set of variables containing all of the from and to variables.
+ * @returns {Map<String,String>} Normalized variable name to the spelling first seen for it
  */
 const extractVariables = (list) => {
-  const set = new Set();
+  const found = new Map();
   for (const r of list) {
-    set.add(r.from.toLowerCase());
-    set.add(r.to.toLowerCase());
+    for (const name of [r.from, r.to]) {
+      const key = utils.evalsNormalizeVariableName(name);
+      if (!found.has(key)) found.set(key, name);
+    }
   }
-  return set;
+  return found;
+};
+
+/**
+ * Put every relationship endpoint into one namespace before anything counts them.
+ *
+ * This category derives its variable list and its loop graph from relationship endpoints,
+ * and it builds that list from two sources at once: the model's own relationships and the
+ * ones implied by each stock's inflows and outflows. A model that writes "Colonial Identity"
+ * in one and "Colonial_Identity" in the other is not a model with two variables, but that is
+ * what a literal comparison sees — and it was scored as one, failing a max-variables test on
+ * three phantom variables. The same split severs the loop graph into disconnected pieces and
+ * undercounts feedback.
+ *
+ * @param {Array<Object>} list Relationships in the form {from, to, polarity}
+ * @returns {Array<Object>} The same relationships with normalized endpoint names
+ */
+const normalizeRelationshipNames = (list) => {
+  return list.map((r) => {
+    return { ...r, from: utils.evalsNormalizeVariableName(r.from), to: utils.evalsNormalizeVariableName(r.to) };
+  });
 };
 
 /**
@@ -461,25 +488,30 @@ export const makeRelationshipsFromStocks = function(variables) {
  * @returns {Array<Object>} A list of failures with type and details.
  */
 export const evaluate = function(generatedResponse, requirements) {
-  let fromAI = (generatedResponse.model?.relationships || []).concat(makeRelationshipsFromStocks(generatedResponse.model?.variables));
-  const vars = extractVariables(fromAI);
+  const declared = (generatedResponse.model?.relationships || [])
+    .concat(makeRelationshipsFromStocks(generatedResponse.model?.variables));
+  const vars = extractVariables(declared);
   const feedbackLoopCountLimit = getFeedbackLoopCountLimit(requirements);
+  // Loop counting needs one namespace too: a model that spells a variable both ways splits
+  // its own causal graph into disconnected pieces and undercounts its feedback. Normalizing
+  // happens inside the branch so a requirement about variables alone still walks the
+  // relationships exactly once.
   const loopCount = feedbackLoopCountLimit === null
     ? { count: 0, capped: false }
-    : countLoopsInternal(fromAI, { maxCycles: feedbackLoopCountLimit });
+    : countLoopsInternal(normalizeRelationshipNames(declared), { maxCycles: feedbackLoopCountLimit });
   const loops = loopCount.count;
   const fails = [];
   const hasMinFeedback = Number.isFinite(requirements.minFeedback);
   const hasMaxFeedback = Number.isFinite(requirements.maxFeedback);
 
-  if (requirements.variables) {
-    const lowerCaseVariables = requirements.variables.map((v) => { return v.toLowerCase() });
+  const presentVariables = Array.from(vars.values()).join(", ");
 
-    for (const v of lowerCaseVariables) {
-      if (!vars.has(v)) {
+  if (requirements.variables) {
+    for (const v of requirements.variables) {
+      if (!vars.has(utils.evalsNormalizeVariableName(v))) {
         fails.push({
           type: "Missing required variable",
-          details: `Missing ${v}; present: ${Array.from(vars).join(", ")}`
+          details: `Missing ${v.toLowerCase()}; present: ${presentVariables}`
         });
       }
     }
@@ -488,14 +520,14 @@ export const evaluate = function(generatedResponse, requirements) {
   if (requirements.minVariables && vars.size < requirements.minVariables) {
     fails.push({
       type: "Too few variables",
-      details: `Found ${vars.size} variables: ${Array.from(vars).join(", ")}`
+      details: `Found ${vars.size} variables: ${presentVariables}`
     });
   }
 
   if (requirements.maxVariables && vars.size > requirements.maxVariables) {
     fails.push({
       type: "Too many variables",
-      details: `Found ${vars.size} variables: ${Array.from(vars).join(", ")}`
+      details: `Found ${vars.size} variables: ${presentVariables}`
     });
   }
 
@@ -517,6 +549,30 @@ export const evaluate = function(generatedResponse, requirements) {
 
   return validateEvaluationResult(fails);
 };
+
+/**
+ * Returns the methodology for this category: how its tests are built and run, what the evaluator
+ * checks, and how those checks combine into a verdict. Each `criteria[].name` is the exact failure
+ * `type` {@link evaluate} records when that criterion is not met. Rendered by the documentation
+ * site on every test page.
+ * @returns {{howItWorks: Array<string>, criteria: Array<{name: string, description: string}>, scoring: string}}
+ */
+export const methodology = () => ({
+    howItWorks: [
+        `Conformance is instruction-following, so it has to be measured where more than one right answer exists. Two open-ended real-world cases carry every test — a feedback-based explanation of how the American Revolution came about, and one of road rage — each with a fixed problem statement and background knowledge. One conformance instruction is appended to that base, and it is the instruction, not the domain, that is under test. A synthetic ground-truth universe would not work here: it admits a single correct representation, so asking an engine to simplify or elaborate it would be asking for something wrong.`,
+        `Nine instructions are applied to each case, giving 18 tests in two groups. "specificConformance" names three variables the response must contain — Taxation, Anti British Sentiment and Colonial Identity for the Revolution; Traffic Congestion, Driver Stress and Accidents for road rage. "genericConformance" sets numeric limits: at least 10 or no more than 5 variables, at least 8 or no more than 4 feedback loops, and four instructions that constrain loops and variables at once. The values are chosen to be demanding at both ends, since simplifying on request is as much a test as elaborating.`,
+        `The response is read as a causal graph. Relationships are the model's own, plus one derived per stock flow — each inflow a positive link into its stock, each outflow a negative one — so a stock-and-flow answer is counted the same way a causal loop diagram is. Variables are the distinct endpoints of those relationships, normalized case- and separator-insensitively, so "Driver Stress", "driver_stress" and "driverstress" are one variable rather than three.`,
+        `Feedback loops are the elementary cycles of that graph, counted with Johnson's algorithm, and only when a test actually constrains them. Counting stops once it passes the limit that would settle the test, so a "too many feedback loops" failure may report a floor ("at least N") rather than an exact total.`
+    ],
+    criteria: [
+        { name: 'Missing required variable', description: 'A variable the instruction named is not among the model’s relationship endpoints. Recorded once per missing variable, alongside the variables that were present.' },
+        { name: 'Too few variables', description: 'The model holds fewer distinct variables than the instruction’s minimum.' },
+        { name: 'Too many variables', description: 'The model holds more distinct variables than the instruction’s maximum.' },
+        { name: 'Too few feedback loops', description: 'Fewer elementary cycles were found than the instruction’s minimum.' },
+        { name: 'Too many feedback loops', description: 'More elementary cycles were found than the instruction’s maximum.' }
+    ],
+    scoring: `Only the constraints a given test sets are checked, and each is independent — a test that limits both loops and variables can fail on either or both. Nothing about the substance of the explanation is graded here: a conformant answer passes whether or not it is a good account of the Revolution, and that separation is deliberate, since causal reasoning is measured by its own categories.`
+});
 
 /**
  * The groups of tests to be evaluated as a part of this category
