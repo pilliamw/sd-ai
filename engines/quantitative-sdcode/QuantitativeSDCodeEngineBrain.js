@@ -433,6 +433,100 @@ Please generate stock-and-flow models (SFDs) from user-provided queries to the b
         this.#llmWrapper = new LLMWrapper(this.#data);
     }
 
+    /* Sourced from quantitative engine */
+
+    #filterInvalidRelationships(response, variablesByFoldedName) {
+        const origRelationships = response.relationships || [];
+        const seenPairs = new Set();
+        const validRelationships = [];
+
+        for (const relationship of origRelationships) {
+            const from = relationship.from.trim();
+            const to = relationship.to.trim();
+            const foldedFrom = projectUtils.caseFold(from);
+            const foldedTo = projectUtils.caseFold(to);
+
+            if (foldedFrom === foldedTo) continue;
+
+            const toVar = variablesByFoldedName.get(foldedTo);
+            if (!toVar || !variablesByFoldedName.has(foldedFrom)) continue;
+
+            if (toVar.crossLevelGhostOf && toVar.crossLevelGhostOf.length > 0) continue;
+
+            if (from.includes('[') || to.includes('[')) continue;
+
+            const pairKey = foldedFrom + '\x00' + foldedTo;
+            if (seenPairs.has(pairKey)) continue;
+            seenPairs.add(pairKey);
+
+            const cleaned = Object.assign({}, relationship);
+            cleaned.from = from;
+            cleaned.to = to;
+            validRelationships.push(cleaned);
+        }
+
+        response.relationships = validRelationships;
+    }
+
+    #cleanStockFlowsAndCollectUsage(stocks, variablesByFoldedName, usedFlowNames) {
+        const cleanList = (list) => {
+            const result = [];
+            for (const flowName of list) {
+                const cleaned = flowName.replace(/\[.*?\]/g, '').trim();
+                if (cleaned.length === 0) continue;
+                const folded = projectUtils.caseFold(cleaned);
+                if (!variablesByFoldedName.has(folded)) continue;
+                result.push(cleaned);
+                usedFlowNames.add(folded);
+            }
+            return result;
+        };
+
+        for (const v of stocks) {
+            if (Array.isArray(v.inflows)) v.inflows = cleanList(v.inflows);
+            if (Array.isArray(v.outflows)) v.outflows = cleanList(v.outflows);
+        }
+    }
+
+    #inferStockFlowsFromRelationships(response, variablesByFoldedName, usedFlowNames) {
+        // LLMs like gemini-3-flash-preview don't reliably emit inflow/outflow lists for stocks,
+        // so derive them from flow→stock relationships (polarity decides in vs out).
+        const flowSetsByStock = new Map();
+
+        const ensureSets = (stockVar) => {
+            let sets = flowSetsByStock.get(stockVar);
+            if (sets) return sets;
+            if (!stockVar.inflows) stockVar.inflows = [];
+            if (!stockVar.outflows) stockVar.outflows = [];
+            sets = {
+                inflows: new Set(stockVar.inflows.map(f => projectUtils.caseFold(f))),
+                outflows: new Set(stockVar.outflows.map(f => projectUtils.caseFold(f)))
+            };
+            flowSetsByStock.set(stockVar, sets);
+            return sets;
+        };
+
+        for (const relationship of response.relationships) {
+            const toVariable = variablesByFoldedName.get(projectUtils.caseFold(relationship.to));
+            if (!toVariable || toVariable.type !== 'stock') continue;
+            const fromVariable = variablesByFoldedName.get(projectUtils.caseFold(relationship.from));
+            if (!fromVariable || fromVariable.type !== 'flow') continue;
+
+            const sets = ensureSets(toVariable);
+            const foldedFromName = projectUtils.caseFold(fromVariable.name);
+            if (sets.inflows.has(foldedFromName) || sets.outflows.has(foldedFromName)) continue;
+
+            if (relationship.polarity === '-') {
+                toVariable.outflows.push(fromVariable.name);
+                sets.outflows.add(foldedFromName);
+            } else {
+                toVariable.inflows.push(fromVariable.name);
+                sets.inflows.add(foldedFromName);
+            }
+            usedFlowNames.add(foldedFromName);
+        }
+    }
+
     #fixVariablesAndConvertEquations(response, usedFlowNames, variableNameMap, namesToConvert) {
         // Compile the XMILE replacement regex ONCE (skip entirely if nothing to convert).
         let combinedRegex = null;
@@ -505,6 +599,102 @@ Please generate stock-and-flow models (SFDs) from user-provided queries to the b
             }
         }
     }
+    
+    #mergeModules(response, usedModules, moduleNameMapping) {
+        if (!response.modules) response.modules = [];
+
+        // Single pass: build existing-modules lookup AND honor parentModule chains
+        // (a module referenced only as someone's parent is still in use).
+        const existingModulesMap = new Map();
+        for (const m of response.modules) {
+            if (m.name) {
+                const normalized = projectUtils.caseFold(m.name);
+                if (!existingModulesMap.has(normalized)) {
+                    existingModulesMap.set(normalized, m);
+                }
+            }
+            if (m.parentModule && m.parentModule.trim().length > 0) {
+                const normalizedParent = projectUtils.caseFold(m.parentModule);
+                usedModules.add(normalizedParent);
+                if (!moduleNameMapping.has(normalizedParent)) {
+                    moduleNameMapping.set(normalizedParent, m.parentModule);
+                }
+            }
+        }
+
+        const newModules = [];
+        for (const normalized of usedModules) {
+            const existing = existingModulesMap.get(normalized);
+            if (existing) {
+                newModules.push(existing);
+            } else {
+                newModules.push({
+                    name: moduleNameMapping.get(normalized),
+                    parentModule: ""
+                });
+            }
+        }
+
+        response.modules = newModules;
+    }
+
+    #cleanSDJsonModel(originalResponse) {
+        originalResponse.variables = originalResponse.variables || [];
+        
+        // Pass 1: ONE walk over variables that builds every lookup structure the
+        // downstream helpers need — fold-name map, XMILE rename table, module
+        // usage, and a stocks-only list to avoid filtering again in pass 2.
+        const variablesByFoldedName = new Map();
+        const variableNameMap = new Map();   // raw name → xmile name (spaces → underscores)
+        const namesToConvert = [];           // raw names needing XMILE conversion
+        const usedModules = new Set();       // fold(moduleName) for any module referenced by a variable
+        const moduleNameMapping = new Map(); // fold(moduleName) → canonical capitalization
+        const stocks = [];
+
+        for (const v of originalResponse.variables) {
+            if (!v.name) continue;
+
+            variablesByFoldedName.set(projectUtils.caseFold(v.name), v);
+
+            if (v.type === 'stock') stocks.push(v);
+
+            if (v.name.includes(' ')) {
+                variableNameMap.set(v.name, projectUtils.xmileName(v.name));
+                namesToConvert.push(v.name);
+            }
+
+            if (v.name.includes('.')) {
+                const parts = v.name.split('.');
+                for (let i = 0; i < parts.length - 1; i++) {
+                    const normalized = projectUtils.caseFold(parts[i]);
+                    usedModules.add(normalized);
+                    if (!moduleNameMapping.has(normalized)) {
+                        moduleNameMapping.set(normalized, parts[i]);
+                    }
+                }
+            }
+        }
+
+        this.#filterInvalidRelationships(originalResponse, variablesByFoldedName);
+
+        // Pass 2: walk stocks only — clean inflow/outflow refs and seed the
+        // used-flow set. #inferStockFlowsFromRelationships then adds any
+        // additional flows it derives from relationships.
+        const usedFlowNames = new Set();
+        this.#cleanStockFlowsAndCollectUsage(stocks, variablesByFoldedName, usedFlowNames);
+        this.#inferStockFlowsFromRelationships(originalResponse, variablesByFoldedName, usedFlowNames);
+
+        // Pass 3: combined per-variable mutation pass — flow-type fixup,
+        // DT→TIME, forElements normalization, and XMILE rewriting.
+        this.#fixVariablesAndConvertEquations(originalResponse, usedFlowNames, variableNameMap, namesToConvert);
+
+        // No variable loop needed — module usage was already collected in pass 1.
+        this.#mergeModules(originalResponse, usedModules, moduleNameMapping);
+
+        return originalResponse;
+    }
+
+    /* SDCode-specific helpers */
 
     #splitArgsByComma(str) {
         const args = [];
@@ -608,7 +798,7 @@ Please generate stock-and-flow models (SFDs) from user-provided queries to the b
             }
         }
 
-        return res;
+        return this.#cleanSDJsonModel(res);
     }
 
     #verifyArgumentTypes(args, types, lineNum) {
@@ -653,7 +843,7 @@ Please generate stock-and-flow models (SFDs) from user-provided queries to the b
             dt: null,
             timeUnits: null,
             integrationMethod: null,
-            arrayDimensions: [] // TODO
+            arrayDimensions: [] // TODO: Unimplemented
         }
         const mdl = {
             variables: [],
@@ -661,19 +851,17 @@ Please generate stock-and-flow models (SFDs) from user-provided queries to the b
             explanation: explanation,
             title: originalResponse.title,
             specs: simSpecs,
-            modules: [] // TODO
+            modules: []
         }
 
         let lineNum = 0;
-        // TODO: This loop does NOT currently ensure the validity of the generated model.
         for (const line of program) {
             lineNum++;
-            if (line.startsWith("```")) continue; // markdown backticks, ignore
-            if (line === "") continue; // blank line/newline, ignore
+            if (line.indexOf("(") === -1) continue; // no method call; ignore
             if (line[0] === "#") continue; // full comment line, ignore
             
             // shorthand for lineParsed
-            const lp = this.#extractMethodArguments(line, lineNum);
+            const lp = this.#extractMethodArguments((line.startsWith("```") ? line.slice(3) : line), lineNum);
             // debug
             // console.log(lp);
 
@@ -701,10 +889,8 @@ Please generate stock-and-flow models (SFDs) from user-provided queries to the b
                 }
 
                 if (compType.toLowerCase() === "module") {
-                    // TODO: VERIFY MODULE NAME IS NOT DUPLICATE
                     mdl.modules.push(compName);
                 } else {
-                    // TODO: VERIFY NAME IS NOT ALREADY TAKEN
                     mdl.variables.push({
                         name: compName,
                         documentation: lp.comment,
@@ -712,7 +898,7 @@ Please generate stock-and-flow models (SFDs) from user-provided queries to the b
                             { 
                                 units: lp.args[0], 
                                 type: compType.toLowerCase(), 
-                                equation: "" // TODO: ENFORCE THAT THIS IS SET LATER
+                                equation: ""
                             }
                         ),
                         ...(compType.toLowerCase() === "stock" && 
@@ -722,8 +908,7 @@ Please generate stock-and-flow models (SFDs) from user-provided queries to the b
                             { uniflow: false } // default false, set to true later if .setUniflow() is called
                         ),
                         ...(compType.toLowerCase() === "ghost" &&
-                            { 
-                                // TODO: VERIFY CROSS LEVEL GHOST ELEMENT IS DEFINED
+                            {
                                 crossLevelGhostOf: this.#cleanComponentName(lp.args[0], lineNum), 
                                 type: "variable",
                                 equation: ""
@@ -758,7 +943,6 @@ Please generate stock-and-flow models (SFDs) from user-provided queries to the b
                     if (compObj.type !== "stock") throw new SDCodeError(`component ${compName} is not stock`, lineNum);
                     this.#verifyArgumentTypes(lp.args, [""], lineNum);
                     const secondComp = this.#cleanComponentName(lp.args[0], lineNum);
-                    // TODO: WE DON'T CHECK IF THIS COMPONENT ACTUALLY EXISTS, IF ITS BOTH INFLOW AND OUTFLOW, ETC.
                     if (compMethod === "addInflow") compObj.inflows.push(secondComp);
                     else compObj.outflows.push(secondComp);
                 } else if (compMethod === "connect") {
@@ -790,47 +974,151 @@ Please generate stock-and-flow models (SFDs) from user-provided queries to the b
         );
     }
 
-    #convertToSDCode(model) {
-        const moduleDeclarations = [];
-        const declarations = [];
-        const ghostDeclarations = [];
-        const methodCalls = [];
-        const connections = [];
-        if (Array.isArray(model.modules)) {
-            for (const module of model.modules) {
-                moduleDeclarations.push(`[${module.name}] = new Module()`); // TODO: FIX THIS WITH NESTED MODULES
+    #orderStatementsByDependency(dependencies) {
+        //console.log(dependencies);
+        const n = dependencies.length;
+        const remaining = dependencies.map((deps) => deps.size);
+        const dependents = Array.from({ length: n }, () => []); // transpose of dependencies
+        for (let i = 0; i < n; i++) {
+            for (const dep of dependencies[i]) {
+                dependents[dep].push(i);
             }
         }
+
+        const added = new Array(n).fill(false);
+        const order = [];
+
+        const addStatement = (i) => {
+            if (added[i]) return;
+            added[i] = true;
+            order.push(i);
+
+            // cascade down
+            for (const dependent of dependents[i]) {
+                remaining[dependent]--;
+                if (remaining[dependent] === 0) {
+                    addStatement(dependent);
+                }
+            }
+        };
+
+        // add 0-dependency statements in order, cascading after each one
+        for (let i = 0; i < n; i++) {
+            if (remaining[i] === 0) {
+                addStatement(i);
+            }
+        }
+
+        // fallback: force-add all unadded statements that may be part of a dependency cycle
+        for (let i = 0; i < n; i++) {
+            if (!added[i]) {
+                addStatement(i);
+            }
+        }
+
+        //console.log(order);
+
+        return order;
+    }
+
+    #convertToSDCode(model) {
+        let cnt = -1;
+        const statements = [];
+        const componentDeclarations = new Map();
+        const componentEquations = new Map();
+        const dependencies = [];
+        const dependents = [];
+        
+        if (Array.isArray(model.modules)) {
+            for (const module of model.modules) {
+                // todo: this currently doesn't work with nested modules
+                cnt++;
+                statements.push(`[${module.name}] = new Module()`);
+                dependencies.push(new Set());
+            }
+        }
+
+        // add non-ghost component declarations
+        const ghostComps = [];
         for (const varObj of model.variables) {
             if (varObj.crossLevelGhostOf != null && varObj.crossLevelGhostOf.trim() !== "") {
-                ghostDeclarations.push(`[${varObj.name}] = Ghost([${varObj.crossLevelGhostOf.trim()}])`);
-            } else {
-                declarations.push(`[${varObj.name}] = ${varObj.type[0].toUpperCase() + varObj.type.slice(1)}("${varObj.units ?? "units"}")${varObj.documentation != null && varObj.documentation.trim() !== "" ? ` # ${varObj.documentation.trim()}` : ""}`);
-                methodCalls.push(`[${varObj.name}].setEquation("${varObj.equation}")`);
+                ghostComps.push(varObj);
+                continue;
             }
-            
+
+            cnt++;
+            statements.push(`[${varObj.name}] = ${varObj.type[0].toUpperCase() + varObj.type.slice(1)}("${varObj.units ?? "units"}")${varObj.documentation != null && varObj.documentation.trim() !== "" ? ` # ${varObj.documentation.trim()}` : ""}`)
+            dependencies.push(new Set());
+            componentDeclarations.set(varObj.name, cnt);
+        }
+
+        for (const varObj of ghostComps) {
+            cnt++;
+            statements.push(`[${varObj.name}] = Ghost([${varObj.crossLevelGhostOf.trim()}])`);
+            dependencies.push(new Set());
+            dependencies[cnt].add(componentDeclarations.get(varObj.crossLevelGhostOf.trim()));
+            componentDeclarations.set(varObj.name, cnt);
+        }
+
+        const flowStatements = [];
+        for (const varObj of model.variables) {
+            cnt++;
+            statements.push(`[${varObj.name}].setEquation("${varObj.equation}")`);
+            dependencies.push(new Set());
+            dependencies[cnt].add(componentDeclarations.get(varObj.name));
+            componentEquations.set(varObj.name, cnt);
+
             if (varObj.type === "flow" && varObj.uniflow) {
-                methodCalls.push(`[${varObj.name}].setUniflow()`);
+                cnt++;
+                statements.push(`[${varObj.name}].setUniflow()`);
+                dependencies.push(new Set());
+                dependencies[cnt].add(componentDeclarations.get(varObj.name));
             }
             if (varObj.type === "stock") {
                 if (varObj.inflows !== undefined) {
                     for (const inflow of varObj.inflows) {
-                        methodCalls.push(`[${varObj.name}].addInflow([${inflow}])`);
+                        flowStatements.push([`[${varObj.name}].addInflow([${inflow}])`, varObj.name, inflow]);
                     }
                 }
                 if (varObj.outflows !== undefined) {
                     for (const outflow of varObj.outflows) {
-                        methodCalls.push(`[${varObj.name}].addOutflow([${outflow}])`);
+                        flowStatements.push([`[${varObj.name}].addOutflow([${outflow}])`, varObj.name, outflow]);
                     }
                 }
             }
         }
-        for (const rel of model.relationships) {
-            connections.push(`[${rel.from}].connect([${rel.to}], ${rel.polarity === "+" || rel.polarity === undefined || rel.polarity === null ? 1 : 0})${rel.reasoning != null && rel.reasoning.trim() !== "" ? ` # ${rel.reasoning.trim()}` : ""}`)
+
+        for (const flst of flowStatements) {
+            cnt++;
+            statements.push(flst[0]);
+            dependencies.push(new Set());
+            dependencies[cnt].add(componentEquations.get(flst[1]));
+            dependencies[cnt].add(componentEquations.get(flst[2]));
         }
-        // long one-liner; apologies
-        const program = [`setup("${model.specs.timeUnits ?? "day"}", ${model.specs.startTime ?? 0}, ${model.specs.stopTime ?? 10.0}, ${model.specs.dt ?? 0.25}, "${model.specs.integrationMethod ?? "Euler"}")`]
-            .concat(moduleDeclarations.concat(declarations.concat(ghostDeclarations.concat(methodCalls.concat(connections)))));
+
+        for (const rel of model.relationships) {
+            cnt++;
+            statements.push(`[${rel.from}].connect([${rel.to}], ${rel.polarity === "+" || rel.polarity === undefined || rel.polarity === null ? 1 : 0})${rel.reasoning != null && rel.reasoning.trim() !== "" ? ` # ${rel.reasoning.trim()}` : ""}`)
+            dependencies.push(new Set());
+            dependencies[cnt].add(componentDeclarations.get(rel.from));
+            dependencies[cnt].add(componentDeclarations.get(rel.to));
+            if (componentEquations.get(rel.from) != null) dependencies[cnt].add(componentEquations.get(rel.from));
+            if (componentEquations.get(rel.to) != null) {
+                dependencies[cnt].add(componentEquations.get(rel.to));
+                dependencies[componentEquations.get(rel.to)].add(componentDeclarations.get(rel.from));
+            }
+        }
+
+        // fallback to remove invalid dependencies
+        for (let i = 0; i < dependencies.length; i++) {
+            dependencies[i].delete(undefined);
+            dependencies[i].delete(i);
+        }
+
+        const setupLine = `setup("${model.specs.timeUnits ?? "day"}", ${model.specs.startTime ?? 0}, ${model.specs.stopTime ?? 10.0}, ${model.specs.dt ?? 0.25}, "${model.specs.integrationMethod ?? "Euler"}")`;
+        const orderedIndices = this.#orderStatementsByDependency(dependencies);
+        const program = [setupLine, ...orderedIndices.map((i) => statements[i])];
+
         console.log("=== USER-PROVIDED MODEL (CONVERTED TO SDCODE) ===");
         for (const line of program) {
             console.log(line);
@@ -871,7 +1159,7 @@ Please generate stock-and-flow models (SFDs) from user-provided queries to the b
             messages.push({ 
                 role: "assistant", 
                 content: JSON.stringify({ 
-                    program: this.#convertToSDCode(lastModel),
+                    program: this.#convertToSDCode(this.#cleanSDJsonModel(lastModel)),
                     explanation: ""
                 }, null, 2)
             });
